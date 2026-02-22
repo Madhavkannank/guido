@@ -1,3 +1,13 @@
+---
+title: GUIDO
+emoji: 🧬
+colorFrom: green
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 #  GUIDO — Multi-Omics Disease Risk Modeling System
 
 A **production-ready, LLM-guided multi-omics disease risk pipeline** with a full React UI.
