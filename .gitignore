@@ -30,7 +30,7 @@ data/raw/
 data/processed/
 
 # ── Model artifacts (large binaries) ─────────────────────────────────────────
-models_artifacts/
+# models_artifacts/ — committed to repo (served from container)
 
 # ── Results (regeneratable caches only) ───────────────────────────────────────
 results/pubmed_cache/
