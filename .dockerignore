@@ -1,0 +1,29 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.dockerignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Large data files — mounted as volumes in docker-compose (local dev)
+# For cloud deployment (Railway/Render/Fly.io), comment out models_artifacts
+# so the trained models are baked into the image.
+data/
+# models_artifacts/   ← uncomment this line to EXCLUDE models from image (use volumes instead)
+results/
+mlruns/
+
+# UI build artifacts
+ui/node_modules/
+ui/dist/
+
+# Docs & metadata
+*.md
+LICENSE
+logs_*.txt

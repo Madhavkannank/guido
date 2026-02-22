@@ -1,0 +1,62 @@
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!ui/.env.example
+!ui/.env.production
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+*.egg
+*.whl
+*.so
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+ui/dist/
+.vite/
+ui/.vite/
+
+# ── Data (too large for git) ──────────────────────────────────────────────────
+data/raw/
+data/processed/
+
+# ── Model artifacts (large binaries) ─────────────────────────────────────────
+models_artifacts/
+
+# ── Results (regeneratable caches only) ───────────────────────────────────────
+results/pubmed_cache/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs_*.txt
+uvicorn.log
+
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlruns/
+*.db
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Temp / scratch ────────────────────────────────────────────────────────────
+v/
+deps/
