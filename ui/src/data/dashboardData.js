@@ -77,8 +77,9 @@ export const sampleDistribution = cancerTypes.map(c => ({
 }))
 
 /** Total patients across all cohorts */
-export const totalPatients = Object.values(sampleCounts).reduce((s,v) => s + v.total, 0)
-export const totalCancerTypes = cancerTypes.length
+export const totalPatients       = Object.values(sampleCounts).reduce((s,v) => s + v.total, 0)
+export const totalCancerTypes    = cancerTypes.length
+export const totalClinicalModels = Object.keys(clinicalMetrics).length
 export const avgClinicalAUROC = +(
   Object.values(clinicalAUROC).reduce((s,v) => s+v, 0) / Object.values(clinicalAUROC).length
 ).toFixed(3)

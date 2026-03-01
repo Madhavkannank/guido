@@ -1,12 +1,12 @@
 import React, { useState } from 'react'
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   PieChart, Pie, Cell, Sector, Legend,
 } from 'recharts'
 import {
   aurocComparison, sampleDistribution,
-  totalPatients, totalCancerTypes, avgClinicalAUROC,
+  totalPatients, totalCancerTypes, totalClinicalModels, avgClinicalAUROC,
   clinicalMetrics,
 } from '../data/dashboardData'
 
@@ -65,7 +65,8 @@ export default function Dashboard(){
       {/* Stats row */}
       <div className="dash-stats-row">
         <Stat value={totalPatients.toLocaleString()} label="Total Patients" />
-        <Stat value={totalCancerTypes}              label="Cancer Types" />
+        <Stat value={totalCancerTypes}               label="TCGA Cohorts" />
+        <Stat value={totalClinicalModels}            label="Models Trained" />
         <Stat value={avgClinicalAUROC}              label="Avg Clinical AUROC" />
         <Stat value="500"                           label="Genes per Model" />
       </div>
@@ -74,7 +75,7 @@ export default function Dashboard(){
       <div className="dash-card">
         <div className="dash-card-header">
           <h3 className="dash-card-title">Model Performance — Test AUROC</h3>
-          <p className="dash-card-desc">Clinical (tumor vs normal) vs synthetic labels across 10 TCGA cohorts · leak-free · class-balanced</p>
+          <p className="dash-card-desc">{totalClinicalModels} clinical models (tumor vs normal) · leak-free · class-balanced · 15% held-out test split</p>
         </div>
         <div className="dash-chart" style={{height: 320}}>
           <ResponsiveContainer>
@@ -82,7 +83,10 @@ export default function Dashboard(){
               <XAxis dataKey="cancer" tick={{fill: MUTED, fontSize:11}} axisLine={false} tickLine={false} />
               <YAxis domain={[0,1.05]} tick={{fill: MUTED, fontSize:11}} axisLine={false} tickLine={false}
                      tickFormatter={v => v.toFixed(1)} />
-              <Tooltip contentStyle={tooltipStyle} labelStyle={tooltipLabelStyle} itemStyle={tooltipItemStyle} cursor={{fill:'rgba(255,255,255,0.03)'}} />
+              <Tooltip contentStyle={tooltipStyle} labelStyle={tooltipLabelStyle} itemStyle={tooltipItemStyle} cursor={{fill:'rgba(255,255,255,0.03)'}}
+                       formatter={(v, name) => [v.toFixed(3), name]} />
+              <ReferenceLine y={0.5} stroke="rgba(255,255,255,0.15)" strokeDasharray="4 3"
+                             label={{value:'Random (0.5)', position:'insideTopRight', fill:'rgba(255,255,255,0.3)', fontSize:10}} />
               <Bar dataKey="Clinical"  fill={GREEN}  radius={[4,4,0,0]} barSize={18} />
               <Bar dataKey="Synthetic" fill={MUTED}   radius={[4,4,0,0]} barSize={18} />
               <Legend wrapperStyle={{fontSize:12, color: MUTED}} />
@@ -132,8 +136,30 @@ export default function Dashboard(){
                 <PolarAngleAxis dataKey="metric" tick={{fill: MUTED, fontSize:11}} />
                 <PolarRadiusAxis domain={[0,1]} tick={false} axisLine={false} />
                 <Radar dataKey="value" stroke={GREEN} fill={GREEN} fillOpacity={0.25} strokeWidth={2} />
+                <Tooltip contentStyle={tooltipStyle} labelStyle={tooltipLabelStyle} itemStyle={tooltipItemStyle}
+                         formatter={v => [(v * 100).toFixed(1) + '%', 'Value']} />
               </RadarChart>
             </ResponsiveContainer>
+          </div>
+          {/* Metric value chips */}
+          <div style={{display:'flex', flexWrap:'wrap', gap:'4px 6px', padding:'0 1rem 1rem', justifyContent:'center'}}>
+            {radarKeys.map(k => {
+              const v = clinicalMetrics[radarCancer]?.[k]
+              if (v === undefined) return null
+              const pct = (v * 100).toFixed(1)
+              const dim = v < 0.85
+              return (
+                <div key={k} style={{
+                  padding:'3px 10px', borderRadius:99, fontSize:11,
+                  background: dim ? 'rgba(232,112,112,0.12)' : 'rgba(90,106,83,0.18)',
+                  border: `1px solid ${dim ? 'rgba(232,112,112,0.25)' : 'rgba(90,106,83,0.35)'}`,
+                  color: dim ? '#e87070' : '#AABAA3',
+                }}>
+                  <span style={{color: MUTED, marginRight:4}}>{k.charAt(0).toUpperCase()+k.slice(1)}</span>
+                  {pct}%
+                </div>
+              )
+            })}
           </div>
         </div>
       </div>
