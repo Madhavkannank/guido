@@ -44,12 +44,18 @@ export const sampleCounts = {
 
 // Detailed evaluation metrics — test split, from evaluation_clinical.json
 // Re-computed after applying all three training fixes.
+// NOTE: GBM has only 5 normal samples total → test set has 0–1 normals → specificity is unreliable.
 export const clinicalMetrics = {
-  BRCA: { accuracy:0.9945, precision:1.000,  recall:0.9939, f1:0.9970, auroc:0.9993, specificity:1.000,  sensitivity:0.9939 },
-  KIRC: { accuracy:0.9890, precision:1.000,  recall:0.9875, f1:0.9937, auroc:0.9989, specificity:1.000,  sensitivity:0.9875 },
-  LUAD: { accuracy:0.9885, precision:1.000,  recall:0.9872, f1:0.9935, auroc:0.9957, specificity:1.000,  sensitivity:0.9872 },
-  LUSC: { accuracy:0.9880, precision:1.000,  recall:0.9867, f1:0.9933, auroc:1.000,  specificity:1.000,  sensitivity:0.9867 },
-  PRAD: { accuracy:0.9518, precision:0.9863, recall:0.9600, f1:0.9730, auroc:0.9367, specificity:0.875,  sensitivity:0.9600 },
+  BRCA: { accuracy:0.9945, precision:1.0000, recall:0.9939, f1:0.9970, auroc:0.9993, specificity:1.0000, sensitivity:0.9939 },
+  COAD: { accuracy:0.9800, precision:0.9778, recall:1.0000, f1:0.9888, auroc:1.0000, specificity:0.8333, sensitivity:1.0000 },
+  GBM:  { accuracy:0.9583, precision:0.9583, recall:1.0000, f1:0.9787, auroc:1.0000, specificity:0.0000, sensitivity:1.0000 },
+  KICH: { accuracy:0.9286, precision:0.9091, recall:1.0000, f1:0.9524, auroc:1.0000, specificity:0.7500, sensitivity:1.0000 },
+  KIRC: { accuracy:0.9890, precision:1.0000, recall:0.9875, f1:0.9937, auroc:0.9989, specificity:1.0000, sensitivity:0.9875 },
+  KIRP: { accuracy:1.0000, precision:1.0000, recall:1.0000, f1:1.0000, auroc:1.0000, specificity:1.0000, sensitivity:1.0000 },
+  LIHC: { accuracy:0.9688, precision:1.0000, recall:0.9643, f1:0.9818, auroc:0.9978, specificity:1.0000, sensitivity:0.9643 },
+  LUAD: { accuracy:0.9885, precision:1.0000, recall:0.9872, f1:0.9935, auroc:0.9957, specificity:1.0000, sensitivity:0.9872 },
+  LUSC: { accuracy:0.9880, precision:1.0000, recall:0.9867, f1:0.9933, auroc:1.0000, specificity:1.0000, sensitivity:0.9867 },
+  PRAD: { accuracy:0.9518, precision:0.9863, recall:0.9600, f1:0.9730, auroc:0.9367, specificity:0.8750, sensitivity:0.9600 },
 }
 
 // -- Derived chart-ready arrays --
