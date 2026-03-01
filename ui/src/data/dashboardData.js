@@ -1,5 +1,10 @@
 // Static data harvested from results TCGA xgboost summary and evaluation JSON files.
-// These numbers come from the actual training runs.
+// Retrained 2026-03-01 with three fixes:
+//   (1) leak-free feature selection (inside train split only, ANOVA F-test)
+//   (2) class-imbalance correction via scale_pos_weight = n_neg/n_pos
+//   (3) regularised XGBoost (max_depth=4, reg_lambda=2, adaptive min_child_weight)
+// Test-AUROC numbers come from held-out 15% test split, never touched during training.
+// LGG / PAAD / SKCM have 0–4 normal samples in TCGA → binary classifier not possible.
 
 export const cancerTypes = [
   'BRCA','COAD','GBM','KICH','KIRC','KIRP','LGG','LIHC','LUAD','LUSC','PAAD','PRAD','SKCM'
@@ -12,11 +17,12 @@ export const syntheticAUROC = {
   LUAD: 0.419, LUSC: 0.503, PAAD: 0.472, PRAD: 0.472, SKCM: 0.460,
 }
 
-// XGBoost clinical-label models  (results/TCGA-*/xgboost_clinical_summary.json)
+// XGBoost clinical-label models — HONEST test-split AUROCs after fixes
+// (results/TCGA-*/xgboost_clinical_summary.json → test_auroc)
 export const clinicalAUROC = {
-  BRCA: 1.000, COAD: 1.000, GBM: 1.000, KICH: 1.000,
-  KIRC: 1.000, KIRP: 1.000, LIHC: 0.993, LUAD: 1.000,
-  LUSC: 1.000, PRAD: 0.972,
+  BRCA: 0.999, COAD: 1.000, GBM: 1.000, KICH: 1.000,
+  KIRC: 0.999, KIRP: 1.000, LIHC: 0.998, LUAD: 0.996,
+  LUSC: 1.000, PRAD: 0.937,
 }
 
 // Sample counts
@@ -36,14 +42,14 @@ export const sampleCounts = {
   SKCM: { total:  474, tumor:  474, normal:   0 },
 }
 
-// Detailed evaluation metrics (clinical models — test split)
-// Source: results/TCGA-*/evaluation_clinical.json → test_* fields
+// Detailed evaluation metrics — test split, from evaluation_clinical.json
+// Re-computed after applying all three training fixes.
 export const clinicalMetrics = {
-  BRCA: { accuracy:1.000, precision:1.000, recall:1.000, f1:1.000, auroc:1.000, specificity:1.000, sensitivity:1.000 },
-  KIRC: { accuracy:0.989, precision:0.988, recall:1.000, f1:0.994, auroc:1.000, specificity:0.909, sensitivity:1.000 },
-  LUAD: { accuracy:1.000, precision:1.000, recall:1.000, f1:1.000, auroc:1.000, specificity:1.000, sensitivity:1.000 },
-  LUSC: { accuracy:0.988, precision:0.987, recall:1.000, f1:0.993, auroc:1.000, specificity:0.875, sensitivity:1.000 },
-  PRAD: { accuracy:0.940, precision:0.973, recall:0.960, f1:0.966, auroc:0.972, specificity:0.750, sensitivity:0.960 },
+  BRCA: { accuracy:0.9945, precision:1.000,  recall:0.9939, f1:0.9970, auroc:0.9993, specificity:1.000,  sensitivity:0.9939 },
+  KIRC: { accuracy:0.9890, precision:1.000,  recall:0.9875, f1:0.9937, auroc:0.9989, specificity:1.000,  sensitivity:0.9875 },
+  LUAD: { accuracy:0.9885, precision:1.000,  recall:0.9872, f1:0.9935, auroc:0.9957, specificity:1.000,  sensitivity:0.9872 },
+  LUSC: { accuracy:0.9880, precision:1.000,  recall:0.9867, f1:0.9933, auroc:1.000,  specificity:1.000,  sensitivity:0.9867 },
+  PRAD: { accuracy:0.9518, precision:0.9863, recall:0.9600, f1:0.9730, auroc:0.9367, specificity:0.875,  sensitivity:0.9600 },
 }
 
 // -- Derived chart-ready arrays --
