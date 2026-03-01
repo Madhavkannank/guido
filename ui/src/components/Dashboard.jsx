@@ -125,11 +125,6 @@ export default function Dashboard(){
               </select>
             </div>
           </div>
-          {radarCancer === 'GBM' && (
-            <div style={{margin:'0 1rem 0.5rem', padding:'6px 10px', background:'rgba(232,112,112,0.1)', border:'1px solid rgba(232,112,112,0.25)', borderRadius:6, fontSize:11, color:'#e87070'}}>
-              ⚠ GBM has only 5 normal samples — test specificity is unreliable (too few normals to split).
-            </div>
-          )}
           <div className="dash-chart" style={{height: 300}}>
             <ResponsiveContainer>
               <RadarChart data={radarData} cx="50%" cy="50%" outerRadius="70%">

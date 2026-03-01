@@ -4,7 +4,8 @@
 //   (2) class-imbalance correction via scale_pos_weight = n_neg/n_pos
 //   (3) regularised XGBoost (max_depth=4, reg_lambda=2, adaptive min_child_weight)
 // Test-AUROC numbers come from held-out 15% test split, never touched during training.
-// LGG / PAAD / SKCM have 0–4 normal samples in TCGA → binary classifier not possible.
+// LGG / PAAD / SKCM have 0 normal samples in TCGA → binary classifier not possible.
+// GBM has only 5 normal samples → insufficient for a reliable stratified split (excluded).
 
 export const cancerTypes = [
   'BRCA','COAD','GBM','KICH','KIRC','KIRP','LGG','LIHC','LUAD','LUSC','PAAD','PRAD','SKCM'
@@ -19,8 +20,9 @@ export const syntheticAUROC = {
 
 // XGBoost clinical-label models — HONEST test-split AUROCs after fixes
 // (results/TCGA-*/xgboost_clinical_summary.json → test_auroc)
+// GBM excluded: only 5 normal samples total — insufficient for a reliable split.
 export const clinicalAUROC = {
-  BRCA: 0.999, COAD: 1.000, GBM: 1.000, KICH: 1.000,
+  BRCA: 0.999, COAD: 1.000, KICH: 1.000,
   KIRC: 0.999, KIRP: 1.000, LIHC: 0.998, LUAD: 0.996,
   LUSC: 1.000, PRAD: 0.937,
 }
@@ -44,11 +46,9 @@ export const sampleCounts = {
 
 // Detailed evaluation metrics — test split, from evaluation_clinical.json
 // Re-computed after applying all three training fixes.
-// NOTE: GBM has only 5 normal samples total → test set has 0–1 normals → specificity is unreliable.
 export const clinicalMetrics = {
   BRCA: { accuracy:0.9945, precision:1.0000, recall:0.9939, f1:0.9970, auroc:0.9993, specificity:1.0000, sensitivity:0.9939 },
   COAD: { accuracy:0.9800, precision:0.9778, recall:1.0000, f1:0.9888, auroc:1.0000, specificity:0.8333, sensitivity:1.0000 },
-  GBM:  { accuracy:0.9583, precision:0.9583, recall:1.0000, f1:0.9787, auroc:1.0000, specificity:0.0000, sensitivity:1.0000 },
   KICH: { accuracy:0.9286, precision:0.9091, recall:1.0000, f1:0.9524, auroc:1.0000, specificity:0.7500, sensitivity:1.0000 },
   KIRC: { accuracy:0.9890, precision:1.0000, recall:0.9875, f1:0.9937, auroc:0.9989, specificity:1.0000, sensitivity:0.9875 },
   KIRP: { accuracy:1.0000, precision:1.0000, recall:1.0000, f1:1.0000, auroc:1.0000, specificity:1.0000, sensitivity:1.0000 },

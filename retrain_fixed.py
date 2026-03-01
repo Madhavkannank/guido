@@ -94,8 +94,12 @@ def load_xena(cancer: str) -> tuple[np.ndarray, np.ndarray, list]:
     # Label: -01 = tumor (1), -11 = normal (0)
     tumor_cols  = [c for c in df.columns if c.endswith("-01")]
     normal_cols = [c for c in df.columns if c.endswith("-11")]
-    if len(normal_cols) < 3:
-        raise ValueError(f"{cancer}: only {len(normal_cols)} normal samples — insufficient")
+    MIN_NORMAL = 15   # need enough normals to stratify train/val/test reliably
+    if len(normal_cols) < MIN_NORMAL:
+        raise ValueError(
+            f"{cancer}: only {len(normal_cols)} normal samples — need ≥{MIN_NORMAL} "
+            f"for a reliable train/val/test split (skipping)"
+        )
 
     keep_cols = tumor_cols + normal_cols
     X = df[keep_cols].T.fillna(0).values.astype(np.float32)   # samples × genes
