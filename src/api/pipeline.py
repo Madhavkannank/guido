@@ -63,6 +63,32 @@ def run_training_pipeline(
     splits = split_data(X, y)
     X_train, y_train = splits["train"]
     X_val,   y_val   = splits["val"]
+    X_test,  y_test  = splits["test"]
+    
+    # ── FIX DATA LEAKAGE: Feature selection on training data ONLY ──────────────
+    # Compute variance ONLY on training samples to prevent test set leakage
+    from config.settings import MIN_VARIANCE_THRESHOLD, N_TOP_GENES
+    train_variances = X_train.var(axis=0)
+    high_var = train_variances[train_variances >= MIN_VARIANCE_THRESHOLD]
+    
+    # Select top features: prioritize by variance, use at most 500 genes
+    # This ensures we capture signal genes while avoiding overfitting to noise
+    target_n_features = min(500, len(high_var), int(X_train.shape[0] * 0.5))  # At most 50% of training samples
+    if high_var.empty:
+        top_features = train_variances.nlargest(max(1, target_n_features)).index.tolist()
+    else:
+        top_features = high_var.nlargest(max(1, target_n_features)).index.tolist()
+    
+    logger.info("Feature selection: %d genes selected from %d based on training set variance (target=%d)", 
+                len(top_features), X_train.shape[1], target_n_features)
+    
+    # Apply the SAME feature subset to all splits (no re-selection)
+    X_train = X_train[top_features]
+    X_val = X_val[top_features]
+    X_test = X_test[top_features]
+    splits["train"] = (X_train, y_train)
+    splits["val"] = (X_val, y_val)
+    splits["test"] = (X_test, y_test)
 
     # ── Baselines ─────────────────────────────────────────────────────────────
     from src.models.baselines import run_baselines
@@ -157,9 +183,13 @@ def run_biomarker_pipeline(project_id: str) -> Dict[str, Any]:
     disease_kw = get_disease_keyword(project_id)
     gene_abstracts = fetch_all_biomarkers(stable_biomarkers, disease_kw, project_id)
 
-    # LLM validation
-    from src.llm.groq_validator import run_full_llm_validation
-    llm_results = run_full_llm_validation(gene_abstracts, disease_kw)
+    # LLM validation (Gemini primary, GUIDO fallback)
+    from src.llm.provider_router import run_biomarker_confidence_score, run_adversarial_falsification
+    llm_results: Dict[str, Any] = {}
+    for gene, abstracts in gene_abstracts.items():
+        evidence = run_biomarker_confidence_score(gene, disease_kw, abstracts)
+        adversarial = run_adversarial_falsification(gene, disease_kw, abstracts)
+        llm_results[gene] = {"evidence": evidence, "adversarial": adversarial}
 
     # BCS
     from src.models.confidence_scoring import compute_biomarker_confidence, save_confidence_scores
@@ -180,11 +210,11 @@ def run_literature_pipeline(
 ) -> Dict[str, Any]:
     """Retrieve PubMed abstracts + run LLM validation for a single gene."""
     from src.literature.pubmed_retrieval import fetch_pubmed_abstracts
-    from src.llm.groq_validator import validate_biomarker_evidence, adversarial_falsify
+    from src.llm.provider_router import run_biomarker_confidence_score, run_adversarial_falsification
 
     abstracts = fetch_pubmed_abstracts(gene, disease_keyword)
-    evidence = validate_biomarker_evidence(gene, disease_keyword, abstracts)
-    adversarial = adversarial_falsify(gene, disease_keyword, abstracts) if run_adversarial else None
+    evidence = run_biomarker_confidence_score(gene, disease_keyword, abstracts)
+    adversarial = run_adversarial_falsification(gene, disease_keyword, abstracts) if run_adversarial else None
 
     return {
         "gene": gene,
@@ -357,8 +387,9 @@ def run_biomedical_audit_pipeline(audit_input: Dict[str, Any]) -> Dict[str, Any]
     disease_name = str(audit_input.get("disease_name", "disease")).strip() or "disease"
     safe_disease = disease_name.lower().replace(" ", "_").replace("/", "_")
 
-    from src.llm.groq_validator import run_biomedical_system_audit, generate_clinical_guidance
-    report = run_biomedical_system_audit(audit_input)
+    from src.llm.provider_router import run_biomedical_audit
+    from src.llm.groq_validator import generate_clinical_guidance
+    report = run_biomedical_audit(audit_input)
     
     # Generate clinical guidance separately
     try:

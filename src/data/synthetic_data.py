@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 def generate_synthetic_dataset(
     n_samples: int = 400,
     n_genes: int = N_TOP_GENES,
-    n_signal_genes: int = 50,
+    n_signal_genes: int = 150,
     pos_rate: float = 0.40,
     project_id: str = TCGA_PROJECT_ID,
     seed: int = RANDOM_SEED,
@@ -38,11 +38,17 @@ def generate_synthetic_dataset(
     """
     Generate synthetic log2(TPM+1) expression matrix with embedded signal.
 
-    n_signal_genes genes have expression differences between classes,
+    n_signal_genes genes have strong expression differences between classes,
     representing biologically meaningful variation. The rest is noise.
+    
+    Improved signal: 150 signal genes with 2.5-5.0 log2 fold-change effect.
+    Total of 800 genes (reduced from 2000) for better signal-to-noise ratio.
     """
     rng = np.random.default_rng(seed)
 
+    # Reduce total genes for better signal concentration
+    n_genes = min(n_genes, 800)  # Cap at 800 genes instead of 2000
+    
     # Gene IDs using ENSG-style naming
     gene_ids = [f"ENSG{str(i).zfill(11)}" for i in range(n_genes)]
 
@@ -55,10 +61,11 @@ def generate_synthetic_dataset(
     # Base expression (log2TPM-like: range ~0-15)
     X = rng.normal(loc=6.0, scale=2.0, size=(n_samples, n_genes))
 
-    # Inject signal into first n_signal_genes
-    signal_idx = np.arange(n_signal_genes)
-    for i in range(n_signal_genes):
-        effect = rng.uniform(1.0, 3.0)  # fold-change effect
+    # Inject STRONG signal into first n_signal_genes
+    # Use 2.5-5.0 log2 fold-change (much stronger than before)
+    signal_idx = np.arange(min(n_signal_genes, n_genes))
+    for i in signal_idx:
+        effect = rng.uniform(2.5, 5.0)  # STRONGER fold-change: 2.5-5.0 (was 1.0-3.0)
         X[y_arr == 1, i] += effect
 
     # Clip to valid log2TPM range [0, 18]

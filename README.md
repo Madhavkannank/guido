@@ -308,6 +308,43 @@ BCS = S  ((E_raw - 1) / 4)  (1 - V)
 
 ---
 
+##  AI Provider Layer
+
+GUIDO uses **Gemini as the primary biomedical reasoning layer** and automatically falls back to GUIDO's existing audit pipeline if Gemini is unavailable.
+
+| Priority | Provider | Trigger |
+|----------|----------|---------|
+| 1 (primary) | Gemini | Always attempted first |
+| 2 (fallback) | GUIDO / Groq pipeline | Gemini key missing, request fails, timeout, invalid JSON, missing fields, or `confidence_score` outside [0, 1] |
+
+Every response includes routing metadata:
+```json
+{
+  "provider_used": "gemini",
+  "fallback_reason": null
+}
+```
+or on fallback:
+```json
+{
+  "provider_used": "guido_fallback",
+  "fallback_reason": "gemini_api_key_missing"
+}
+```
+
+Set in `.env`:
+```
+AI_PRIMARY_PROVIDER=gemini
+AI_FALLBACK_PROVIDER=guido
+GEMINI_API_KEY=your_gemini_api_key_here
+GOOGLE_CLOUD_PROJECT=your_project_id
+GOOGLE_CLOUD_LOCATION=us-central1
+```
+
+No manual `LLM_PROVIDER` selection is required — Gemini is the default when `GEMINI_API_KEY` is set.
+
+---
+
 ##  Training Pipeline
 
 | Step | Script | Description |

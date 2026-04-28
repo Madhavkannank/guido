@@ -77,6 +77,16 @@ app.add_middleware(
 )
 
 
+# ─── Lifecycle events (cleanup on shutdown) ───────────────────────────────────
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanly shutdown thread pool and other resources."""
+    logger.info("Shutting down resources...")
+    _executor.shutdown(wait=True)
+    logger.info("Thread pool executor shut down.")
+
+
 # ─── Utility ──────────────────────────────────────────────────────────────────
 
 async def _run_in_executor(func, *args, **kwargs):

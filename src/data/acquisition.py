@@ -270,18 +270,20 @@ def run_acquisition(project_id: str = TCGA_PROJECT_ID, max_files: Optional[int] 
     # Align & label
     X_full, y = align_and_label(expr_log2tpm, clinical)
 
-    # Filter variance  (transpose back to genes × samples for variance calc)
-    X_t = X_full.T  # genes × samples
-    X_filtered_t, gene_list = filter_low_variance(X_t, MIN_VARIANCE_THRESHOLD, N_TOP_GENES)
-    X_processed = X_filtered_t.T  # samples × genes
+    # NOTE: Feature selection/filtering is now done in the training pipeline
+    # (src/api/pipeline.py) to prevent data leakage from test set variance.
+    # We return all features here; filtering happens only on training data.
+    X_processed = X_full  # No variance filtering here!
 
-    # Persist
+    # Persist all features (filtering happens in pipeline during training)
     X_processed.to_parquet(processed_dir / "rnaseq_processed.parquet")
     y.to_frame().to_parquet(processed_dir / "labels.parquet")
-    pd.Series(gene_list, name="gene_id").to_csv(processed_dir / "gene_list.csv", index=False)
+    all_genes = X_processed.columns.tolist()
+    pd.Series(all_genes, name="gene_id").to_csv(processed_dir / "gene_list.csv", index=False)
 
-    logger.info("Processing complete. Shape: %s, Labels: %s", X_processed.shape, y.value_counts().to_dict())
-    return X_processed, y, gene_list
+    logger.info("Processing complete (NO feature filtering applied here). Shape: %s, Labels: %s", 
+                X_processed.shape, y.value_counts().to_dict())
+    return X_processed, y, all_genes
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────

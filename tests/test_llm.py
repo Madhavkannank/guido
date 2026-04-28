@@ -181,3 +181,80 @@ def test_biomedical_audit_strict_success_short_circuit():
             result = run_biomedical_system_audit(payload, groq_client=MagicMock())
 
     assert result["overall_system_verdict"] == "ok"
+
+
+# ─── Provider Router tests ────────────────────────────────────────────────────
+
+_VALID_GEMINI_RESPONSE = {
+    "verdict": "supported",
+    "confidence_score": 0.85,
+    "evidence_summary": "Strong clinical evidence.",
+    "risk_explanation": "Gene is upregulated in disease.",
+    "limitations": "Small cohort sizes.",
+    "cited_pubmed_ids": ["12345678"],
+    "provider_used": "gemini",
+    "fallback_reason": None,
+}
+
+_AUDIT_INPUT = {
+    "disease_name": "breast cancer",
+    "multi_omics_features": {"genomics_features": ["BRCA1"], "transcriptomics_features": [], "proteomics_features": []},
+    "selected_biomarkers": ["BRCA1"],
+    "shap_importance_scores": {"BRCA1": 0.9},
+    "stability_scores": {"BRCA1": 0.8},
+    "model_metrics": {"auroc": 0.9},
+    "training_sample_size": 200,
+    "validation_sample_size": 50,
+}
+
+
+def test_router_gemini_success():
+    """Gemini succeeds → provider_used = gemini."""
+    from src.llm.provider_router import run_biomedical_audit
+    with patch("src.llm.provider_router._get_gemini_key", return_value="fake_key"), \
+         patch("src.llm.provider_router._call_gemini", return_value=dict(_VALID_GEMINI_RESPONSE)):
+        result = run_biomedical_audit(_AUDIT_INPUT)
+    assert result["provider_used"] == "gemini"
+    assert result["fallback_reason"] is None
+
+
+def test_router_missing_gemini_key_uses_fallback():
+    """Missing GEMINI_API_KEY → provider_used = guido_fallback."""
+    from src.llm.provider_router import run_biomedical_audit
+    fallback_result = {"overall_system_verdict": "ok", "data_audit": {}, "model_performance_review": {},
+                       "biomarker_analysis": [], "flagged_unstable_features": [], "high_confidence_targets": []}
+    with patch("src.llm.provider_router._get_gemini_key", return_value=""), \
+         patch("src.llm.groq_validator.GROQ_API_KEY", "test_key"), \
+         patch("src.llm.groq_validator._call_groq", return_value=fallback_result):
+        result = run_biomedical_audit(_AUDIT_INPUT)
+    assert result["provider_used"] == "guido_fallback"
+    assert result["fallback_reason"] == "gemini_api_key_missing"
+
+
+def test_router_gemini_invalid_json_uses_fallback():
+    """Gemini returns None (invalid JSON) → provider_used = guido_fallback."""
+    from src.llm.provider_router import run_biomedical_audit
+    fallback_result = {"overall_system_verdict": "ok", "data_audit": {}, "model_performance_review": {},
+                       "biomarker_analysis": [], "flagged_unstable_features": [], "high_confidence_targets": []}
+    with patch("src.llm.provider_router._get_gemini_key", return_value="fake_key"), \
+         patch("src.llm.provider_router._call_gemini", return_value=None), \
+         patch("src.llm.groq_validator.GROQ_API_KEY", "test_key"), \
+         patch("src.llm.groq_validator._call_groq", return_value=fallback_result):
+        result = run_biomedical_audit(_AUDIT_INPUT)
+    assert result["provider_used"] == "guido_fallback"
+    assert result["fallback_reason"] == "gemini_call_failed"
+
+
+def test_router_gemini_missing_fields_uses_fallback():
+    """Gemini output missing required fields → provider_used = guido_fallback."""
+    from src.llm.provider_router import run_biomedical_audit
+    incomplete = {"verdict": "supported"}  # missing confidence_score etc.
+    fallback_result = {"overall_system_verdict": "ok", "data_audit": {}, "model_performance_review": {},
+                       "biomarker_analysis": [], "flagged_unstable_features": [], "high_confidence_targets": []}
+    with patch("src.llm.provider_router._get_gemini_key", return_value="fake_key"), \
+         patch("src.llm.provider_router._call_gemini", return_value=incomplete), \
+         patch("src.llm.groq_validator.GROQ_API_KEY", "test_key"), \
+         patch("src.llm.groq_validator._call_groq", return_value=fallback_result):
+        result = run_biomedical_audit(_AUDIT_INPUT)
+    assert result["provider_used"] == "guido_fallback"
+    assert "gemini_invalid_output" in result["fallback_reason"]

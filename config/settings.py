@@ -71,6 +71,14 @@ GROQ_AUDIT_MODEL: str   = os.getenv("GROQ_AUDIT_MODEL", "llama-3.3-70b-versatile
 GROQ_TEMPERATURE: float = float(os.getenv("GROQ_TEMPERATURE", "0.0"))
 GROQ_MAX_TOKENS:  int   = int(os.getenv("GROQ_MAX_TOKENS", "4096"))
 
+# ─── AI Provider (Gemini primary, GUIDO fallback) ─────────────────────────────
+AI_PRIMARY_PROVIDER:    str = os.getenv("AI_PRIMARY_PROVIDER", "gemini")
+AI_FALLBACK_PROVIDER:   str = os.getenv("AI_FALLBACK_PROVIDER", "guido")
+GEMINI_API_KEY:         str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL:           str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GOOGLE_CLOUD_PROJECT:   str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+GOOGLE_CLOUD_LOCATION:  str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
 # ─── FastAPI server ───────────────────────────────────────────────────────────
 API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
 API_PORT: int = int(os.getenv("API_PORT", "8000"))

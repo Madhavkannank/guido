@@ -78,8 +78,11 @@ def fetch_pubmed_abstracts(
     try:
         # Search
         handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="relevance")
-        record = Entrez.read(handle)
-        handle.close()
+        try:
+            record = Entrez.read(handle)
+        finally:
+            handle.close()
+        
         pmids: List[str] = record.get("IdList", [])
 
         if not pmids:
@@ -91,8 +94,10 @@ def fetch_pubmed_abstracts(
 
         # Fetch record details
         handle = Entrez.efetch(db="pubmed", id=",".join(pmids), rettype="medline", retmode="text")
-        records = list(Medline.parse(handle))
-        handle.close()
+        try:
+            records = list(Medline.parse(handle))
+        finally:
+            handle.close()
 
         abstracts = []
         for rec in records:
