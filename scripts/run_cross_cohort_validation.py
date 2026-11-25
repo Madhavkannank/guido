@@ -46,10 +46,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(
 log = logging.getLogger(__name__)
 
 
-def find_model_artifact(requested_model: str) -> Tuple[Optional[Path], str, List[str]]:
+def find_model_artifact(requested_model: str, dataset: str = "") -> Tuple[Optional[Path], str, List[str]]:
     """
     Resolves the model artifact path by checking local and Google Drive locations,
-    handling aliases, and falling back to enclosing pan-cancer/pan-organ models.
+    handling aliases, auto-selecting organ-matched models, and falling back to enclosing pan-cancer models.
     """
     search_dirs = [
         ROOT / "models_artifacts",
@@ -68,6 +68,18 @@ def find_model_artifact(requested_model: str) -> Tuple[Optional[Path], str, List
     clean_req = requested_model.strip()
 
     if clean_req.lower() == "auto":
+        # Prioritize organ-matched model for the benchmark dataset
+        DATASET_ORGAN_MAP = {
+            "metabric": ["TCGA-PAN-BREAST", "TCGA-BRCA"],
+            "gse31210": ["TCGA-PAN-LUNG", "TCGA-LUAD", "TCGA-LUSC"],
+        }
+        candidates = DATASET_ORGAN_MAP.get(dataset.lower().strip(), [])
+        for cand in candidates:
+            if cand in available_models:
+                log.info("Auto-selected organ-calibrated model '%s' for dataset '%s'", cand, dataset)
+                return available_models[cand], cand, all_ids
+
+        # If organ-matched model is not trained yet, use master Pan-Cancer or first available
         if "TCGA-PAN-CANCER-ALL" in available_models:
             return available_models["TCGA-PAN-CANCER-ALL"], "TCGA-PAN-CANCER-ALL", all_ids
         if available_models:
@@ -111,7 +123,7 @@ def main():
     parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "metabric", "gse31210"], help="External dataset")
     args = parser.parse_args()
 
-    artifact_path, project_id, available = find_model_artifact(args.model)
+    artifact_path, project_id, available = find_model_artifact(args.model, dataset=args.dataset)
 
     if artifact_path is None or not artifact_path.exists():
         log.error("Artifact not found for model: %s", args.model)

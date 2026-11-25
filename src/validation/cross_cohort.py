@@ -146,10 +146,13 @@ def align_external_features(
     """
     Standardizes external patient expression using training metagene_stats,
     computes the 12 Hallmark Metagenes, and aligns columns to artifact['features'].
+    Applies cross-platform distribution harmonization (e.g. Microarray vs RNA-Seq)
+    and neutral baseline imputation for missing genes.
     """
     target_features: List[str] = artifact["features"]
     hallmark_pathways: Dict[str, List[str]] = artifact.get("hallmark_metagenes", {})
     metagene_stats: Dict[str, Dict[str, float]] = artifact.get("metagene_stats", {})
+    scaler = artifact.get("scaler")
 
     X_aligned = X_ext.copy()
     if not X_aligned.columns.is_unique:
@@ -157,26 +160,68 @@ def align_external_features(
     if not X_aligned.index.is_unique:
         X_aligned = X_aligned.loc[~X_aligned.index.duplicated(keep="first")]
 
-    # Compute hallmark metagenes using training baseline statistics
+    n_samples = len(X_aligned)
+    # When n_samples > 10, within-cohort relative z-scoring protects against cross-platform batch shifts
+    use_cohort_zscore = n_samples > 10
+
+    # 1. Compute hallmark metagenes with cross-platform relative pathway activation
     for meta_name, gene_list in hallmark_pathways.items():
         if meta_name not in X_aligned.columns:
             z_cols = []
             for g in gene_list:
                 if g in X_aligned.columns:
-                    mu = metagene_stats[g]["mean"] if g in metagene_stats else float(X_aligned[g].mean())
-                    sigma = metagene_stats[g]["std"] if g in metagene_stats else 1.0
-                    z = (X_aligned[g].values - mu) / (sigma + 1e-6)
+                    vals = X_aligned[g].values.astype(float)
+                    if use_cohort_zscore and np.std(vals) > 1e-4:
+                        # Standardize relative to external hospital cohort distribution
+                        z = (vals - np.mean(vals)) / (np.std(vals) + 1e-6)
+                    else:
+                        mu = metagene_stats[g]["mean"] if g in metagene_stats else float(np.mean(vals))
+                        sigma = metagene_stats[g]["std"] if g in metagene_stats else 1.0
+                        z = (vals - mu) / (sigma + 1e-6)
                     z_cols.append(z)
             if z_cols:
                 X_aligned[meta_name] = np.mean(np.column_stack(z_cols), axis=1)
             else:
                 X_aligned[meta_name] = 0.0
 
-    # Reindex to exact 100 features in order
-    missing = set(target_features) - set(X_aligned.columns)
-    if missing:
-        logger.warning("External dataset missing %d features; filling with 0.0", len(missing))
-    X_final = X_aligned.reindex(columns=target_features, fill_value=0.0)
+    # 2. Extract reference scaler means and scales for neutral missing-gene filling and platform alignment
+    feature_means: Dict[str, float] = {}
+    feature_scales: Dict[str, float] = {}
+    if scaler is not None and hasattr(scaler, "mean_") and hasattr(scaler, "scale_"):
+        for idx, feat in enumerate(target_features):
+            feature_means[feat] = float(scaler.mean_[idx])
+            feature_scales[feat] = float(scaler.scale_[idx])
+
+    # 3. Align and harmonise individual features
+    missing_count = 0
+    aligned_dict: Dict[str, np.ndarray] = {}
+    for feat in target_features:
+        ref_mu = feature_means.get(feat, 0.0)
+        ref_sigma = feature_scales.get(feat, 1.0)
+
+        if feat in X_aligned.columns:
+            vals = X_aligned[feat].values.astype(float)
+            # If feature has variance and cohort is multi-patient, harmonise cross-platform shift
+            if use_cohort_zscore and np.std(vals) > 1e-4 and not feat.startswith("META_"):
+                cohort_mu = float(np.mean(vals))
+                cohort_sigma = float(np.std(vals))
+                # Detect platform shift between microarray and RNA-seq (mean shift > 1.5 units)
+                if abs(cohort_mu - ref_mu) > 1.5 or abs(cohort_sigma - ref_sigma) > 1.0:
+                    z = (vals - cohort_mu) / (cohort_sigma + 1e-6)
+                    aligned_dict[feat] = (z * ref_sigma + ref_mu).astype(np.float32)
+                else:
+                    aligned_dict[feat] = vals.astype(np.float32)
+            else:
+                aligned_dict[feat] = vals.astype(np.float32)
+        else:
+            missing_count += 1
+            # Missing gene: fill with reference training mean (produces neutral scaled score of exactly 0.0)
+            aligned_dict[feat] = np.full(n_samples, ref_mu, dtype=np.float32)
+
+    if missing_count > 0:
+        logger.warning("External dataset missing %d features; filled with neutral baseline reference (0.0 scaled)", missing_count)
+
+    X_final = pd.DataFrame(aligned_dict, index=X_aligned.index)[target_features]
     return X_final
 
 
