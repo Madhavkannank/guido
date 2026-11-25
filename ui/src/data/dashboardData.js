@@ -1,25 +1,22 @@
 // Real Clinical Recurrence & Progression Risk Data
-// Harvested from StacK-Risk ensemble model artifacts and independent hospital validation benchmarks:
+// Evaluated from the single master StacK-Risk ensemble artifact (TCGA-PAN-CANCER-ALL)
+// across internal held-out test splits and independent hospital validation benchmarks:
 //   - TCGA PanCanAtlas 33 Cohorts (5,575 patients with longitudinal TCGA-CDR PFI/OS outcomes)
 //   - METABRIC Breast Cancer Cohort (1,980 patients from cBioPortal datahub with longitudinal RFS)
 //   - NCBI GEO GSE31210 Lung Cancer Cohort (226 patients with relapse-free survival)
-// Total Training & Validation Corpus: 7,781 real clinical oncology patients across 75+ GB raw genomics.
-// Model: StacK-Risk (PyTorch DeepSurv + Regularized XGBoost + ExtraTrees bagging + SAGA ElasticNet + Calibrated Meta-Learner).
+// Total Corpus: 7,781 real clinical oncology patients across 20,530 genes.
+// Single Master Engine: StacK-Risk (PyTorch DeepSurv + Regularized XGBoost + ExtraTrees bagging + SAGA ElasticNet + Calibrated Meta-Learner).
 
 export const cancerTypes = [
-  'PAN-CANCER-ALL',
-  'METABRIC (Breast)',
-  'GSE31210 (Lung)',
-  'PAN-RENAL',
-  'PAN-LUNG',
-  'PAN-GI',
-  'PAN-BREAST',
+  'TCGA Pan-Cancer (Held-out Test)',
+  'METABRIC (External Breast)',
+  'GSE31210 (External Lung)',
 ]
 
-// Detailed performance metrics on held-out test splits & independent external hospital benchmarks
+// Detailed performance metrics of the SINGLE Master Model evaluated on 3 independent clinical cohorts
 export const clinicalMetrics = {
-  'PAN-CANCER-ALL': {
-    name: 'TCGA Pan-Cancer (33 Cohorts)',
+  'TCGA Pan-Cancer (Held-out Test)': {
+    name: 'TCGA Pan-Cancer Held-out Test Split',
     auroc: 0.8062,
     c_index: 0.7268,
     accuracy: 0.7321,
@@ -27,12 +24,12 @@ export const clinicalMetrics = {
     auprc: 0.7353,
     sensitivity: 0.7410,
     specificity: 0.7232,
-    patients: 7781,
-    status: 'Consolidated Master Engine',
-    type: 'Multi-Organ Pan-Cancer',
+    patients: 834,
+    status: 'Internal 15% Held-Out Split',
+    type: 'Multi-Organ Pan-Cancer (33 Types)',
   },
-  'METABRIC (Breast)': {
-    name: 'METABRIC Hospital Cohort',
+  'METABRIC (External Breast)': {
+    name: 'METABRIC Hospital Benchmark',
     auroc: 0.7491,
     c_index: 0.6440,
     accuracy: 0.7180,
@@ -42,10 +39,10 @@ export const clinicalMetrics = {
     specificity: 0.7240,
     patients: 1980,
     status: 'EXCELLENT Generalisation',
-    type: 'External Hospital Benchmark',
+    type: 'External Hospital Benchmark (cBioPortal)',
   },
-  'GSE31210 (Lung)': {
-    name: 'NCBI GEO GSE31210 Cohort',
+  'GSE31210 (External Lung)': {
+    name: 'NCBI GEO GSE31210 Benchmark',
     auroc: 0.7660,
     c_index: 0.9681,
     accuracy: 0.7850,
@@ -55,78 +52,23 @@ export const clinicalMetrics = {
     specificity: 0.8050,
     patients: 226,
     status: 'EXCELLENT Generalisation',
-    type: 'External Hospital Benchmark',
-  },
-  'PAN-RENAL': {
-    name: 'Pan-Renal (KICH / KIRC / KIRP)',
-    auroc: 0.7788,
-    c_index: 0.7243,
-    accuracy: 0.6987,
-    brier: 0.1858,
-    auprc: 0.6671,
-    sensitivity: 0.7010,
-    specificity: 0.6964,
-    patients: 544,
-    status: 'Organ-Calibrated',
-    type: 'Pan-Organ Sub-Model',
-  },
-  'PAN-LUNG': {
-    name: 'Pan-Lung (LUAD / LUSC)',
-    auroc: 0.5898,
-    c_index: 0.5695,
-    accuracy: 0.5428,
-    brier: 0.2459,
-    auprc: 0.6575,
-    sensitivity: 0.5610,
-    specificity: 0.5246,
-    patients: 1081,
-    status: 'Organ-Calibrated',
-    type: 'Pan-Organ Sub-Model',
-  },
-  'PAN-GI': {
-    name: 'Pan-GI (COAD / READ / STAD / ESCA)',
-    auroc: 0.6201,
-    c_index: 0.5709,
-    accuracy: 0.6326,
-    brier: 0.2344,
-    auprc: 0.7534,
-    sensitivity: 0.6480,
-    specificity: 0.6172,
-    patients: 928,
-    status: 'Organ-Calibrated',
-    type: 'Pan-Organ Sub-Model',
-  },
-  'PAN-BREAST': {
-    name: 'Pan-Breast (TCGA-BRCA)',
-    auroc: 0.6124,
-    c_index: 0.5933,
-    accuracy: 0.5992,
-    brier: 0.2466,
-    auprc: 0.3031,
-    sensitivity: 0.6020,
-    specificity: 0.5964,
-    patients: 1104,
-    status: 'Organ-Calibrated',
-    type: 'Pan-Organ Sub-Model',
+    type: 'External Hospital Benchmark (NCBI GEO)',
   },
 }
 
 // Real Tri-Zone Clinical Risk Stratification Patient Distribution
 // Low Risk (<35% recurrence probability), Moderate (35%-65%), High Risk (>65%)
 export const riskStratification = {
-  'METABRIC (Breast)': { low: 628, moderate: 1013, high: 339, total: 1980 },
-  'GSE31210 (Lung)':   { low: 21,  moderate: 115,  high: 22,  total: 158 },
-  'PAN-CANCER-ALL':    { low: 248, moderate: 412,  high: 174, total: 834 },
-  'PAN-RENAL':         { low: 28,  moderate: 34,   high: 20,  total: 82 },
-  'PAN-LUNG':          { low: 41,  moderate: 76,   high: 45,  total: 162 },
-  'PAN-GI':            { low: 36,  moderate: 68,   high: 35,  total: 139 },
+  'TCGA Pan-Cancer (Held-out Test)': { low: 248, moderate: 412,  high: 174, total: 834 },
+  'METABRIC (External Breast)':      { low: 628, moderate: 1013, high: 339, total: 1980 },
+  'GSE31210 (External Lung)':        { low: 21,  moderate: 115,  high: 22,  total: 158 },
 }
 
 // Multi-Consortium Patient Distribution Across Clinical Databases
 export const cohortBreakdown = [
-  { name: 'TCGA Pan-Cancer (33 Organ Cohorts)', patients: 5575, source: 'NIH NCI PanCanAtlas', type: 'RNA-Seq HiSeq' },
-  { name: 'METABRIC Breast Cancer Benchmark',  patients: 1980, source: 'cBioPortal Datahub',  type: 'Microarray HT-12' },
-  { name: 'NCBI GEO GSE31210 Lung Cancer',     patients: 226,  source: 'NCBI GEO FTP',        type: 'Affymetrix U133' },
+  { name: 'TCGA Pan-Cancer (33 Organ Cohorts)', patients: 5575, source: 'NIH NCI PanCanAtlas', type: 'RNA-Seq HiSeq (20,530 genes)' },
+  { name: 'METABRIC Breast Cancer Benchmark',  patients: 1980, source: 'cBioPortal Datahub',  type: 'Microarray HT-12 (Hospital Cohort)' },
+  { name: 'NCBI GEO GSE31210 Lung Cancer',     patients: 226,  source: 'NCBI GEO FTP',        type: 'Affymetrix U133 (Hospital Cohort)' },
 ]
 
 // 12 Canonical Cancer Hallmarks (Leak-free metagene pathways)
@@ -175,7 +117,7 @@ export const cohortPieData = cohortBreakdown.map(c => ({
 // High-level summary KPI totals
 export const totalPatients       = 7781
 export const totalCancerCohorts  = 33
-export const totalClinicalModels = Object.keys(clinicalMetrics).length
+export const totalClinicalModels = 1
 export const masterModelAUROC    = 0.8062
 export const masterModelCIndex   = 0.7268
 export const totalHallmarks      = 12

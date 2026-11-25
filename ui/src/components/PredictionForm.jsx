@@ -7,23 +7,8 @@ const API_BASE = import.meta.env.VITE_API_BASE || ''
 
 const diseaseOptions = [
   // Master Pan-Cancer Clinical Model
-  { value: 'pan_cancer_all', label: '★ TCGA-PAN-CANCER-ALL (Master 33-Cohort Clinical Model)' },
-  // Pan-Organ Clinical Risk Models
-  { value: 'pan_renal', label: '★ Pan-Renal Risk Model (KICH / KIRC / KIRP)' },
-  { value: 'pan_lung', label: '★ Pan-Lung Risk Model (LUAD / LUSC)' },
-  { value: 'pan_gi', label: '★ Pan-GI Colorectal/Gastric (COAD / READ / STAD / ESCA)' },
-  { value: 'pan_hepatobiliary', label: '★ Pan-Hepatobiliary (LIHC / CHOL)' },
-  { value: 'pan_breast', label: '★ Pan-Breast Oncology Model (BRCA)' },
-  { value: 'pan_brain', label: '★ Pan-Brain Glioma / Glioblastoma (GBM / LGG)' },
-  { value: 'pan_gyn', label: '★ Pan-Gynecologic (OV / UCEC / CESC / UCS)' },
-  { value: 'pan_urological', label: '★ Pan-Urological (BLCA / PRAD)' },
-  { value: 'pan_headneck', label: '★ Pan-Head & Neck (HNSC)' },
-  { value: 'pan_endocrine', label: '★ Pan-Endocrine (THCA / ACC / PCPG)' },
-  { value: 'pan_sarcoma', label: '★ Pan-Sarcoma (SARC)' },
-  { value: 'pan_melanoma', label: '★ Pan-Melanoma (SKCM / UVM)' },
-  { value: 'pan_hematologic', label: '★ Pan-Hematologic (LAML / DLBC / THYM)' },
-  { value: 'pan_meso', label: '★ Pan-Mesothelioma (MESO)' },
-  // All 33 TCGA Cohorts
+  { value: 'pan_cancer_all', label: '★ TCGA-PAN-CANCER-ALL (Master 33-Cohort Clinical Engine)' },
+  // All 33 TCGA Cohorts (Evaluated via Master Engine & Calibrated Cohort Weights)
   { value: 'adrenocortical_carcinoma', label: 'Adrenocortical Carcinoma (ACC)' },
   { value: 'bladder_urothelial_carcinoma', label: 'Bladder Urothelial Carcinoma (BLCA)' },
   { value: 'breast_invasive_carcinoma', label: 'Breast Invasive Carcinoma (BRCA)' },
@@ -94,21 +79,6 @@ export default function PredictionForm({onResult}){
     setDisease(val);
     const mapping = {
       'pan_cancer_all': 'TCGA-PAN-CANCER-ALL',
-      // Pan-Organ
-      'pan_renal': 'PAN-RENAL',
-      'pan_lung': 'PAN-LUNG',
-      'pan_gi': 'PAN-GI',
-      'pan_hepatobiliary': 'PAN-HEPATOBILIARY',
-      'pan_breast': 'PAN-BREAST',
-      'pan_brain': 'PAN-BRAIN',
-      'pan_gyn': 'PAN-GYN',
-      'pan_urological': 'PAN-UROLOGICAL',
-      'pan_headneck': 'PAN-HEADNECK',
-      'pan_endocrine': 'PAN-ENDOCRINE',
-      'pan_sarcoma': 'PAN-SARCOMA',
-      'pan_melanoma': 'PAN-MELANOMA',
-      'pan_hematologic': 'PAN-HEMATOLOGIC',
-      'pan_meso': 'PAN-MESO',
       // TCGA 33 Cohorts
       'adrenocortical_carcinoma': 'TCGA-ACC',
       'bladder_urothelial_carcinoma': 'TCGA-BLCA',

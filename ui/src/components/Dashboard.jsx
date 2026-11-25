@@ -53,10 +53,10 @@ function Stat({ value, label, subtext }){
 
 /* ---- main dashboard ---- */
 export default function Dashboard(){
-  const [selectedCohort, setSelectedCohort] = useState('PAN-CANCER-ALL')
+  const [selectedCohort, setSelectedCohort] = useState('TCGA Pan-Cancer (Held-out Test)')
   const [hoveredPieIdx, setHoveredPieIdx] = useState(null)
 
-  const selectedMetrics = clinicalMetrics[selectedCohort] || clinicalMetrics['PAN-CANCER-ALL']
+  const selectedMetrics = clinicalMetrics[selectedCohort] || clinicalMetrics['TCGA Pan-Cancer (Held-out Test)']
 
   const radarData = [
     { metric: 'AUROC', value: selectedMetrics.auroc },
@@ -71,8 +71,8 @@ export default function Dashboard(){
     <section className="dashboard">
       {/* Real Clinical Stats row */}
       <div className="dash-stats-row">
-        <Stat value={totalPatients.toLocaleString()} label="Total Real Patients" subtext="TCGA + METABRIC + GEO" />
-        <Stat value={totalCancerCohorts} label="Pan-Cancer Cohorts" subtext="All 33 TCGA types" />
+        <Stat value={totalPatients.toLocaleString()} label="Total Real Patients" subtext="5,575 Train + 2,206 External Test" />
+        <Stat value="1 Master Engine" label="Single Clinical Model" subtext="All 33 Pan-Cancer Types" />
         <Stat value={masterModelAUROC.toFixed(3)} label="Master 3-Yr AUROC" subtext="Held-out 15% test split" />
         <Stat value={masterModelCIndex.toFixed(3)} label="Harrell's C-Index" subtext="Concordance index" />
         <Stat value={`${totalHallmarks} Pathways`} label="Hallmark Metagenes" subtext={`${featuresPerModel} features/model`} />
@@ -83,9 +83,9 @@ export default function Dashboard(){
         <div className="dash-card-header">
           <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 8}}>
             <div>
-              <h3 className="dash-card-title">Genomic Discrimination & Independent Hospital Generalization</h3>
+              <h3 className="dash-card-title">Single Master Model: Multi-Organ & Hospital Validation</h3>
               <p className="dash-card-desc">
-                Harrell's Concordance Index (C-Index) and 3-Year Recurrence AUROC evaluated across held-out splits and live external hospital cohorts.
+                Harrell's Concordance Index (C-Index) and 3-Year Recurrence AUROC of the unified TCGA-PAN-CANCER-ALL engine evaluated across internal held-out test splits and live hospital cohorts.
               </p>
             </div>
             <div style={{display: 'flex', gap: 8}}>
@@ -134,7 +134,7 @@ export default function Dashboard(){
             <ResponsiveContainer>
               <BarChart data={riskStratificationData} layout="vertical" margin={{top:5, right:20, left:20, bottom:5}}>
                 <XAxis type="number" tick={{fill: MUTED, fontSize:11}} axisLine={false} tickLine={false} />
-                <YAxis type="category" dataKey="cohort" tick={{fill:'#EDEDED', fontSize:11}} width={110}
+                <YAxis type="category" dataKey="cohort" tick={{fill:'#EDEDED', fontSize:11}} width={180}
                        axisLine={false} tickLine={false} />
                 <Tooltip contentStyle={tooltipStyle} labelStyle={tooltipLabelStyle} itemStyle={tooltipItemStyle}
                          cursor={{fill:'rgba(255,255,255,0.03)'}}
@@ -205,8 +205,8 @@ export default function Dashboard(){
         {/* Chart 4 — Multi-Consortium Cohort Breakdown */}
         <div className="dash-card">
           <div className="dash-card-header">
-            <h3 className="dash-card-title">Multi-Consortium Training Corpus</h3>
-            <p className="dash-card-desc">7,781 real clinical oncology patients across 75+ GB genomics</p>
+            <h3 className="dash-card-title">Multi-Consortium Patient Corpus</h3>
+            <p className="dash-card-desc">7,781 real clinical oncology patients across 20,530 genes (TCGA, METABRIC, GEO)</p>
           </div>
           <div className="dash-chart" style={{height: 230}}>
             <ResponsiveContainer>
