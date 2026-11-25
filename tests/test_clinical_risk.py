@@ -310,3 +310,52 @@ def test_clean_matrix_axes_and_multi_cohort_concatenation():
     assert X_concat.index.is_unique, "Concatenated indices must be unique"
     assert X_concat.shape[1] == 5  # TP53, EGFR, SLC35E2, BRCA1, ERBB2
 
+
+def test_metabric_rfs_event_parsing_accuracy():
+    """Verify that '0:Not Recurred' is strictly classified as non-event (0), preventing label contamination."""
+    test_cases = pd.Series([
+        "0:Not Recurred",
+        "1:Recurred",
+        "0",
+        "1",
+        "Not Recurred",
+        "Recurred",
+    ])
+    rfs_str = test_cases.astype(str).str.strip()
+    events = (
+        rfs_str.str.startswith("1") |
+        (rfs_str.str.contains("Recurred", case=False, na=False) & ~rfs_str.str.contains("Not", case=False, na=False))
+    ).astype(int)
+
+    expected = np.array([0, 1, 0, 1, 0, 1])
+    np.testing.assert_array_equal(events.values, expected)
+
+
+def test_cross_platform_gene_alias_resolution():
+    """Verify that older microarray probe names (CDCA1, C10orf3, RAB6KIFL) are resolved to modern HGNC symbols."""
+    from src.validation.cross_cohort import align_external_features
+
+    # Create mock artifact targeting modern HGNC symbols
+    artifact = {
+        "features": ["NUF2", "CEP55", "KIF20A", "META_PROLIFERATION"],
+        "hallmark_metagenes": {"META_PROLIFERATION": ["NUF2", "CEP55"]},
+        "metagene_stats": {"NUF2": {"mean": 10.0, "std": 1.5}, "CEP55": {"mean": 9.0, "std": 1.2}},
+    }
+
+    # External expression dataframe using 2008 historical microarray symbols
+    X_legacy = pd.DataFrame({
+        "CDCA1": [9.5, 11.2, 8.8],       # alias for NUF2
+        "C10orf3": [8.9, 9.1, 9.4],     # alias for CEP55
+        "RAB6KIFL": [10.1, 10.4, 9.9],  # alias for KIF20A
+    }, index=["PATIENT_A", "PATIENT_B", "PATIENT_C"])
+
+    aligned = align_external_features(X_legacy, artifact)
+    assert "NUF2" in aligned.columns
+    assert "CEP55" in aligned.columns
+    assert "KIF20A" in aligned.columns
+    assert "META_PROLIFERATION" in aligned.columns
+    # Verify values transferred from legacy columns
+    np.testing.assert_allclose(aligned["NUF2"].values, X_legacy["CDCA1"].values, rtol=1e-5)
+    np.testing.assert_allclose(aligned["CEP55"].values, X_legacy["C10orf3"].values, rtol=1e-5)
+
+

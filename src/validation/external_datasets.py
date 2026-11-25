@@ -104,16 +104,24 @@ def fetch_metabric(
     if cache_file.exists():
         logger.info("Loading cached METABRIC cohort from %s", cache_file)
         df_all = pd.read_parquet(cache_file)
-        if max_samples:
-            df_all = df_all.iloc[:max_samples]
-        meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
-        gene_cols = [c for c in df_all.columns if c not in meta_cols]
-        return (
-            df_all[gene_cols],
-            df_all["_Y_3YR"],
-            df_all["_TIME_DAYS"],
-            df_all["_EVENT"]
-        )
+        # Check if cache is corrupted by the legacy '0:Not Recurred' substring bug (e.g. event rate > 0.80)
+        if df_all["_EVENT"].mean() > 0.80:
+            logger.warning("Cached METABRIC cohort has corrupted event labels (mean event rate %.2f > 0.80). Re-harmonizing...", float(df_all["_EVENT"].mean()))
+            try:
+                cache_file.unlink()
+            except Exception:
+                pass
+        else:
+            if max_samples:
+                df_all = df_all.iloc[:max_samples]
+            meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
+            gene_cols = [c for c in df_all.columns if c not in meta_cols]
+            return (
+                df_all[gene_cols],
+                df_all["_Y_3YR"],
+                df_all["_TIME_DAYS"],
+                df_all["_EVENT"]
+            )
 
     logger.info("Attempting to fetch METABRIC dataset from cBioPortal datahub...")
     try:
@@ -124,12 +132,15 @@ def fetch_metabric(
         df_clin = pd.read_csv(io.StringIO("".join(lines)), sep="\t", index_col="PATIENT_ID")
 
         # Extract survival/recurrence endpoints: prefer Relapse-Free Survival (RFS) over Overall Survival (OS)
+        # Strict parsing: avoid '0:Not Recurred' matching 'Recurred'
         if "RFS_MONTHS" in df_clin.columns and "RFS_STATUS" in df_clin.columns:
             time_days = pd.to_numeric(df_clin["RFS_MONTHS"], errors="coerce") * 30.4375
-            events = df_clin["RFS_STATUS"].astype(str).str.contains("Recurred|1", case=False, na=False).astype(int)
+            rfs_str = df_clin["RFS_STATUS"].astype(str).str.strip()
+            events = (rfs_str.str.startswith("1") | (rfs_str.str.contains("Recurred", case=False, na=False) & ~rfs_str.str.contains("Not", case=False, na=False))).astype(int)
         elif "OS_MONTHS" in df_clin.columns and "OS_STATUS" in df_clin.columns:
             time_days = pd.to_numeric(df_clin["OS_MONTHS"], errors="coerce") * 30.4375
-            events = df_clin["OS_STATUS"].astype(str).str.contains("DECEASED|1", case=False, na=False).astype(int)
+            os_str = df_clin["OS_STATUS"].astype(str).str.strip()
+            events = (os_str.str.startswith("1") | (os_str.str.contains("DECEASED|Dead", case=False, na=False) & ~os_str.str.contains("Living|Alive", case=False, na=False))).astype(int)
         else:
             raise ValueError("Required survival columns missing in METABRIC clinical table.")
 
