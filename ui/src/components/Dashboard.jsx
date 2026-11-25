@@ -5,6 +5,7 @@ import {
   PieChart, Pie, Cell, Sector, Legend,
 } from 'recharts'
 import {
+  cancerTypes,
   modelDiscrimination, riskStratificationData, cohortPieData,
   clinicalMetrics, hallmarkPathways,
   totalPatients, totalCancerCohorts, totalClinicalModels,

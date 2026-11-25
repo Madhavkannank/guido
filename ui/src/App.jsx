@@ -86,7 +86,9 @@ export default function App(){
             <p className="section-desc">Performance metrics across 7,781 real patients (33 TCGA Pan-Cancer cohorts, METABRIC breast cancer, and GSE31210 lung adenocarcinoma) — StacK-Risk multi-epoch ensemble with 12 Hallmark Metagenes and out-of-distribution hospital validation.</p>
           </div>
 
-          <Dashboard />
+          <ErrorBoundary>
+            <Dashboard />
+          </ErrorBoundary>
 
           <div className="section-divider" />
 
