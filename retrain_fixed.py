@@ -698,9 +698,16 @@ def train_strong_risk_model(
         f_scores, _ = f_classif(X_tr, y_tr)
     f_scores = np.nan_to_num(f_scores, nan=0.0)
 
-    # Metagenes always preserved
+    # Prioritize genes with universal cross-cohort coverage to prevent cross-platform feature dropout
+    nonzero_frac = np.mean(X_tr != 0.0, axis=0)
     meta_indices = [raw_feature_names.index(m) for m in meta_names if m in raw_feature_names]
-    top_indiv_indices = [i for i in np.argsort(f_scores)[::-1] if i not in meta_indices][:n_indiv_genes]
+    sorted_candidates = [i for i in np.argsort(f_scores)[::-1] if i not in meta_indices]
+    high_cov_candidates = [i for i in sorted_candidates if nonzero_frac[i] >= 0.65]
+    if len(high_cov_candidates) >= n_indiv_genes:
+        top_indiv_indices = high_cov_candidates[:n_indiv_genes]
+    else:
+        top_indiv_indices = sorted_candidates[:n_indiv_genes]
+
     selected_indices = meta_indices + top_indiv_indices
     selected_features = [raw_feature_names[i] for i in selected_indices]
     top_indiv_genes = [raw_feature_names[i] for i in top_indiv_indices]

@@ -137,6 +137,95 @@ def bootstrap_auroc_ci(
     return round(lower, 4), round(upper, 4)
 
 
+# ─── Comprehensive Cross-Platform Gene Alias Dictionary ─────────────────────
+# Maps historical microarray probe names (Illumina BeadChip & Affymetrix) to modern HGNC symbols
+GENE_ALIASES: Dict[str, List[str]] = {
+    # Proliferation & Mitosis
+    "NUF2": ["CDCA1", "CT106"],
+    "CDC20": ["p55CDC", "bA276H19.1"],
+    "CDK1": ["CDC2", "CDC28A", "P34CDC2"],
+    "AURKA": ["STK15", "BTAK", "AIK", "AURORA2"],
+    "AURKB": ["STK12", "AIM1", "AIK2", "STK5"],
+    "BIRC5": ["API4", "EPR-1", "SURVIVIN"],
+    "CCNB1": ["CCNB"],
+    "CCNE1": ["CCNE"],
+    "PLK1": ["STPK13"],
+    "BUB1B": ["SSK1", "BUBR1", "hBUBR1"],
+    "CENPA": ["CENP-A"],
+    "CENPE": ["CENP-E", "KIF10"],
+    "CENPF": ["CENP-F", "hcp-1", "ST-410"],
+    "HJURP": ["hJn1", "FAKTL"],
+    "PTTG1": ["SECURIN", "EPI-1", "TUTR1"],
+    "TROAP": ["TASTIN"],
+    "CEP55": ["C10orf3", "URCC6"],
+    "KIF11": ["EG5", "TRIP5", "KSP"],
+    "KIF20A": ["MKLP2", "RAB6KIFL", "GG10_2"],
+    "KIF23": ["MKLP1"],
+    "KIF2C": ["MCAK"],
+    "KIF18B": ["KIAA0319L"],
+    "ZWINT": ["ZWINT1", "HZwint-1"],
+    "TPX2": ["DIL2", "p100", "RECA", "HCA519"],
+    "UBE2C": ["UBCH10", "dJ447E24.1"],
+    "FOXM1": ["HFH11", "INS1", "TRIDENT"],
+    "MYBL2": ["B-MYB"],
+    "E2F1": ["RBP3"],
+    "MKI67": ["Ki-67", "KIA"],
+    "PCNA": ["ATLD2"],
+    "TOP2A": ["TOP2"],
+
+    # Epigenetic & Chromatin Regulators
+    "KMT2A": ["MLL", "MLL1", "ALL-1", "HRX", "HTX1"],
+    "KMT2B": ["MLL4", "MLL2", "WBP7", "TRX2"],
+    "KMT2C": ["MLL3", "HALR"],
+    "KMT2D": ["MLL2", "ALR", "KAD4D"],
+    "H3-3A": ["H3F3A", "H3.3A"],
+    "H3-3B": ["H3F3B", "H3.3B"],
+
+    # Extracellular Matrix, Angiogenesis & Signaling
+    "CCN1": ["CYR61", "GIG1", "IGFBP10"],
+    "CCN2": ["CTGF", "HCS24", "IGFBP8"],
+    "CCN3": ["NOV", "IGFBP9"],
+    "CCN4": ["WISP1", "WISP-1"],
+    "CCN5": ["WISP2", "WISP-2"],
+    "CCN6": ["WISP3", "WISP-3"],
+    "ADGRA2": ["GPR124", "TEM5"],
+    "ADGRG1": ["GPR56", "TM7XN1", "BFPP"],
+    "CD274": ["PD-L1", "B7-H1", "PDL1", "B7H1"],
+    "PDCD1": ["PD-1", "PD1", "CD279", "SLEB2"],
+    "PARP1": ["ADPRT", "PPOL", "pADPRT-1", "ARTD1"],
+    "ERBB2": ["HER2", "NEU", "NGL", "TKR1"],
+    "KDR": ["VEGFR2", "FLK1", "CD309"],
+    "FLT1": ["VEGFR1", "FLT"],
+    "FLT4": ["VEGFR3", "PCL"],
+    "PTPRC": ["CD45", "B220", "GP180", "LY5"],
+    "PECAM1": ["CD31", "endoCAM", "PECA1"],
+    "PROM1": ["CD133", "AC133", "PROML1"],
+    "SDC1": ["CD138", "SYND1"],
+    "ENG": ["CD105", "END", "ORW1"],
+    "NCAM1": ["CD56", "MSK39"],
+    "CDH1": ["E-CAD", "CD324", "Arc-1", "UVO"],
+    "CDH2": ["N-CAD", "CD325", "NCAD"],
+    "ACTA2": ["a-SMA", "ACTSA"],
+    "FN1": ["FN", "CIG", "FINC"],
+    "SNAI1": ["SNAIL", "SNA", "dJ710H13.1"],
+    "SNAI2": ["SLUG", "SLUGH1", "WS2D"],
+    "TWIST1": ["TWIST", "bHLHa38", "CSO"],
+    "ZEB1": ["TCF8", "NIL-2-A", "AREB6"],
+    "ZEB2": ["SIP1", "ZFHX1B", "HSPC082"],
+    "HIF1A": ["MOP1", "bHLHe78", "PASD8"],
+    "VEGFA": ["VEGF", "VPF", "MVCD1"],
+    "GLUT1": ["SLC2A1", "GLUT", "DYT18"],
+    "PKM": ["PKM2", "PK3", "CTHBP", "OIP3"],
+    "LDHA": ["GSD11", "LDHM"],
+}
+
+ALIAS_TO_GENE: Dict[str, str] = {}
+for canon_sym, alias_list in GENE_ALIASES.items():
+    ALIAS_TO_GENE[canon_sym.upper()] = canon_sym
+    for a in alias_list:
+        ALIAS_TO_GENE[a.upper()] = canon_sym
+
+
 # ─── Feature & Metagene Alignment ────────────────────────────────────────────
 
 def align_external_features(
@@ -146,8 +235,9 @@ def align_external_features(
     """
     Standardizes external patient expression using training metagene_stats,
     computes the 12 Hallmark Metagenes, and aligns columns to artifact['features'].
-    Applies cross-platform distribution harmonization (e.g. Microarray vs RNA-Seq)
-    and neutral baseline imputation for missing genes.
+    Applies cross-platform distribution harmonization (e.g. Microarray vs RNA-Seq),
+    resolves gene aliases across historical platforms, and applies neutral baseline
+    imputation for missing genes.
     """
     target_features: List[str] = artifact["features"]
     hallmark_pathways: Dict[str, List[str]] = artifact.get("hallmark_metagenes", {})
@@ -161,18 +251,42 @@ def align_external_features(
         X_aligned = X_aligned.loc[~X_aligned.index.duplicated(keep="first")]
 
     n_samples = len(X_aligned)
-    # When n_samples > 10, within-cohort relative z-scoring protects against cross-platform batch shifts
     use_cohort_zscore = n_samples > 10
+
+    # Build fast case-insensitive lookup of columns in external cohort
+    col_lookup: Dict[str, str] = {c.upper(): c for c in X_aligned.columns}
+
+    def resolve_gene_in_cohort(name: str) -> Optional[str]:
+        if name in X_aligned.columns:
+            return name
+        u = name.upper()
+        if u in col_lookup:
+            return col_lookup[u]
+        # Check aliases of name
+        for alias in GENE_ALIASES.get(name, []):
+            if alias.upper() in col_lookup:
+                return col_lookup[alias.upper()]
+        # Check if name is an alias of a canonical gene
+        canon = ALIAS_TO_GENE.get(u)
+        if canon:
+            if canon in X_aligned.columns:
+                return canon
+            if canon.upper() in col_lookup:
+                return col_lookup[canon.upper()]
+            for alt in GENE_ALIASES.get(canon, []):
+                if alt.upper() in col_lookup:
+                    return col_lookup[alt.upper()]
+        return None
 
     # 1. Compute hallmark metagenes with cross-platform relative pathway activation
     for meta_name, gene_list in hallmark_pathways.items():
         if meta_name not in X_aligned.columns:
             z_cols = []
             for g in gene_list:
-                if g in X_aligned.columns:
-                    vals = X_aligned[g].values.astype(float)
+                matched_g = resolve_gene_in_cohort(g)
+                if matched_g is not None:
+                    vals = X_aligned[matched_g].values.astype(float)
                     if use_cohort_zscore and np.std(vals) > 1e-4:
-                        # Standardize relative to external hospital cohort distribution
                         z = (vals - np.mean(vals)) / (np.std(vals) + 1e-6)
                     else:
                         mu = metagene_stats[g]["mean"] if g in metagene_stats else float(np.mean(vals))
@@ -192,20 +306,20 @@ def align_external_features(
             feature_means[feat] = float(scaler.mean_[idx])
             feature_scales[feat] = float(scaler.scale_[idx])
 
-    # 3. Align and harmonise individual features
+    # 3. Align and harmonise individual features with alias resolution
     missing_count = 0
+    missing_genes: List[str] = []
     aligned_dict: Dict[str, np.ndarray] = {}
     for feat in target_features:
         ref_mu = feature_means.get(feat, 0.0)
         ref_sigma = feature_scales.get(feat, 1.0)
 
-        if feat in X_aligned.columns:
-            vals = X_aligned[feat].values.astype(float)
-            # If feature has variance and cohort is multi-patient, harmonise cross-platform shift
+        matched_col = resolve_gene_in_cohort(feat)
+        if matched_col is not None:
+            vals = X_aligned[matched_col].values.astype(float)
             if use_cohort_zscore and np.std(vals) > 1e-4 and not feat.startswith("META_"):
                 cohort_mu = float(np.mean(vals))
                 cohort_sigma = float(np.std(vals))
-                # Detect platform shift between microarray and RNA-seq (mean shift > 1.5 units)
                 if abs(cohort_mu - ref_mu) > 1.5 or abs(cohort_sigma - ref_sigma) > 1.0:
                     z = (vals - cohort_mu) / (cohort_sigma + 1e-6)
                     aligned_dict[feat] = (z * ref_sigma + ref_mu).astype(np.float32)
@@ -215,11 +329,15 @@ def align_external_features(
                 aligned_dict[feat] = vals.astype(np.float32)
         else:
             missing_count += 1
-            # Missing gene: fill with reference training mean (produces neutral scaled score of exactly 0.0)
+            missing_genes.append(feat)
+            # Impute with neutral reference mean (0.0 scaled score)
             aligned_dict[feat] = np.full(n_samples, ref_mu, dtype=np.float32)
 
     if missing_count > 0:
-        logger.warning("External dataset missing %d features; filled with neutral baseline reference (0.0 scaled)", missing_count)
+        logger.info("External dataset missing %d features (%s); aligned with neutral baseline (0.0 scaled)",
+                    missing_count, ", ".join(missing_genes[:5]) + ("..." if len(missing_genes) > 5 else ""))
+    else:
+        logger.info("All %d features successfully resolved and aligned across platforms!", len(target_features))
 
     X_final = pd.DataFrame(aligned_dict, index=X_aligned.index)[target_features]
     return X_final
