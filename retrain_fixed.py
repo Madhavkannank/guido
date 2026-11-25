@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -269,16 +270,42 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     # Load TCGA-CDR survival table
     df_cdr  = pd.read_csv(path_cdr, sep="\t", index_col="sample", low_memory=False)
 
-    # Restrict to primary tumor samples (-01 suffix)
-    tumor_samples = [c for c in df_expr.columns if c.endswith("-01")]
+    # Restrict to tumor samples (primary solid tumor 01, recurrent 02, blood cancer 03, metastatic 06; exclude normal 10/11)
+    def _is_tumor_sample(s: str) -> bool:
+        s = str(s).strip()
+        if s in ("sample", "_PATIENT"):
+            return False
+        parts = s.split("-")
+        if len(parts) >= 4:
+            stype = parts[3][:2]
+            if stype.isdigit():
+                code = int(stype)
+                return 1 <= code <= 9
+        return s.endswith("-01") or "-01" in s
+
+    tumor_samples = [c for c in df_expr.columns if _is_tumor_sample(c)]
+    if not tumor_samples:
+        tumor_samples = [c for c in df_expr.columns if c not in ("sample", "_PATIENT")]
 
     # Restrict to samples present in TCGA-CDR and without redaction flags
+    # Map exact barcode (15-char), vial barcode (16-char), or patient barcode (12-char)
+    cdr_sample_set = set(df_cdr.index)
+    sample_to_cdr = {}
+    for s in tumor_samples:
+        if s in cdr_sample_set:
+            sample_to_cdr[s] = s
+        elif s[:15] in cdr_sample_set:
+            sample_to_cdr[s] = s[:15]
+        elif s[:12] in cdr_sample_set:
+            sample_to_cdr[s] = s[:12]
+
     valid_samples = [
         s for s in tumor_samples
-        if s in df_cdr.index and pd.isna(df_cdr.loc[s, "Redaction"])
+        if s in sample_to_cdr and pd.isna(df_cdr.loc[sample_to_cdr[s], "Redaction"])
     ]
 
-    sub_cdr = df_cdr.loc[valid_samples]
+    sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
+    sub_cdr.index = valid_samples
 
     # Primary survival endpoint: Progression-Free Interval (PFI)
     # Fallback to Overall Survival (OS) if PFI is absent
@@ -444,7 +471,9 @@ def train_strong_risk_model(
 
     # 4. Feature Selection: Top Individual Genes + Hallmark Metagenes
     log.info("  Selecting top %d individual prognostic genes + %d pathway metagenes...", n_indiv_genes, len(meta_names))
-    f_scores, _ = f_classif(X_tr, y_tr)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", (UserWarning, RuntimeWarning))
+        f_scores, _ = f_classif(X_tr, y_tr)
     f_scores = np.nan_to_num(f_scores, nan=0.0)
 
     # Metagenes always preserved

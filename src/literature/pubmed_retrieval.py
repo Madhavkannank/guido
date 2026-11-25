@@ -15,7 +15,13 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from Bio import Entrez, Medline
+try:
+    from Bio import Entrez, Medline
+    _BIO_AVAILABLE = True
+except ImportError:
+    Entrez = None
+    Medline = None
+    _BIO_AVAILABLE = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config.settings import (
@@ -28,9 +34,10 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
-Entrez.email = ENTREZ_EMAIL
-if ENTREZ_API_KEY:
-    Entrez.api_key = ENTREZ_API_KEY
+if _BIO_AVAILABLE and Entrez is not None:
+    Entrez.email = ENTREZ_EMAIL
+    if ENTREZ_API_KEY:
+        Entrez.api_key = ENTREZ_API_KEY
 
 CACHE_DIR = RESULTS_DIR / "pubmed_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -141,6 +148,10 @@ def fetch_pubmed_abstracts(
         return json.loads(cache.read_text(encoding="utf-8"))
 
     # Resolve metagene queries or standard individual gene queries
+    if not _BIO_AVAILABLE:
+        logger.warning("Biopython ('Bio') is not installed. Live PubMed queries disabled.")
+        return []
+
     if gene in _METAGENE_SEARCH_TERMS:
         genes_term, pathway_term = _METAGENE_SEARCH_TERMS[gene]
         query = f"({genes_term}[Title/Abstract] OR {pathway_term}[Title/Abstract]) AND {disease_keyword}[Title/Abstract]"
