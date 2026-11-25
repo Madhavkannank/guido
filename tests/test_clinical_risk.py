@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from retrain_fixed import (
     DEFAULT_N_GENES,
     HALLMARK_PATHWAYS,
+    clean_matrix_axes,
     compute_c_index,
     compute_ipcw_weights,
     compute_leak_free_hallmarks,
@@ -270,3 +271,42 @@ def test_api_ui_predict_success_with_trained_model():
     assert "risk_score" in pred
     assert 0.0 <= pred["risk_score"] <= 100.0
     assert pred["time_horizon"] == "3-Year Progression & Recurrence Risk"
+
+
+def test_clean_matrix_axes_and_multi_cohort_concatenation():
+    """Verify that multi-cohort concatenation cleanly handles duplicate genes and indices without InvalidIndexError."""
+    rng = np.random.default_rng(42)
+    # Simulate matrix 1 with duplicate gene columns and duplicate patient index
+    genes_1 = ["TP53", "EGFR", "SLC35E2", "SLC35E2", "BRCA1"]
+    df_1 = pd.DataFrame(rng.normal(size=(5, 5)), index=["P1", "P2", "P2", "P3", "P4"], columns=genes_1)
+    y_1 = pd.Series([1, 0, 0, 1, 0], index=df_1.index)
+    t_1 = pd.Series([200.0, 1200.0, 1200.0, 400.0, 1500.0], index=df_1.index)
+    e_1 = pd.Series([1, 0, 0, 1, 0], index=df_1.index)
+
+    # Simulate matrix 2 with probe duplicates and different patient IDs
+    genes_2 = ["TP53", "BRCA1", "ERBB2", "ERBB2"]
+    df_2 = pd.DataFrame(rng.normal(size=(4, 4)), index=["P1", "P2", "P5", "P6"], columns=genes_2)
+    y_2 = pd.Series([0, 1, 0, 1], index=df_2.index)
+    t_2 = pd.Series([1100.0, 300.0, 1400.0, 250.0], index=df_2.index)
+    e_2 = pd.Series([0, 1, 0, 1], index=df_2.index)
+
+    # Clean both matrices with distinct cohort prefixes
+    X1, y1, t1, e1 = clean_matrix_axes(df_1, y_1, t_1, e_1, prefix="COHORT1")
+    X2, y2, t2, e2 = clean_matrix_axes(df_2, y_2, t_2, e_2, prefix="COHORT2")
+
+    assert X1.columns.is_unique, "Columns in X1 must be unique"
+    assert X2.columns.is_unique, "Columns in X2 must be unique"
+    assert X1.index.is_unique, "Index in X1 must be unique"
+    assert X2.index.is_unique, "Index in X2 must be unique"
+
+    # Multi-cohort concatenation must succeed without InvalidIndexError
+    X_concat = pd.concat([X1, X2], axis=0).fillna(0.0).astype(np.float32)
+    y_concat = np.concatenate([y1.values, y2.values])
+    t_concat = np.concatenate([t1.values, t2.values])
+    e_concat = np.concatenate([e1.values, e2.values])
+
+    assert len(X_concat) == len(y_concat) == len(t_concat) == len(e_concat)
+    assert X_concat.columns.is_unique, "Concatenated columns must be unique"
+    assert X_concat.index.is_unique, "Concatenated indices must be unique"
+    assert X_concat.shape[1] == 5  # TP53, EGFR, SLC35E2, BRCA1, ERBB2
+

@@ -152,6 +152,10 @@ def align_external_features(
     metagene_stats: Dict[str, Dict[str, float]] = artifact.get("metagene_stats", {})
 
     X_aligned = X_ext.copy()
+    if not X_aligned.columns.is_unique:
+        X_aligned = X_aligned.loc[:, ~X_aligned.columns.duplicated(keep="first")]
+    if not X_aligned.index.is_unique:
+        X_aligned = X_aligned.loc[~X_aligned.index.duplicated(keep="first")]
 
     # Compute hallmark metagenes using training baseline statistics
     for meta_name, gene_list in hallmark_pathways.items():

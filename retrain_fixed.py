@@ -448,6 +448,44 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     return X, y_series, time_series.loc[eval_samples], event_series.loc[eval_samples]
 
 
+def clean_matrix_axes(
+    X_mat: pd.DataFrame,
+    y_ser: pd.Series,
+    t_ser: pd.Series,
+    e_ser: pd.Series,
+    prefix: str = ""
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """
+    Guarantees unique column names (genes) and unique row index (patients).
+    Aligns target, time, and event series to the cleaned matrix.
+    """
+    X_mat = X_mat.copy()
+    X_mat.columns = [str(c).strip() for c in X_mat.columns]
+    if not X_mat.columns.is_unique:
+        X_mat = X_mat.loc[:, ~X_mat.columns.duplicated(keep="first")]
+
+    y_ser = y_ser.copy()
+    t_ser = t_ser.copy()
+    e_ser = e_ser.copy()
+
+    # Deduplicate row index (patients) using positional boolean mask to maintain strict 1:1 alignment
+    if not X_mat.index.is_unique:
+        keep_mask = ~X_mat.index.duplicated(keep="first")
+        X_mat = X_mat.iloc[keep_mask]
+        y_ser = y_ser.iloc[keep_mask]
+        t_ser = t_ser.iloc[keep_mask]
+        e_ser = e_ser.iloc[keep_mask]
+
+    if prefix:
+        new_idx = [f"{prefix}_{idx}" for idx in X_mat.index]
+        X_mat.index = new_idx
+        y_ser.index = new_idx
+        t_ser.index = new_idx
+        e_ser.index = new_idx
+
+    return X_mat, y_ser, t_ser, e_ser
+
+
 def extract_unified_cohort(
     cohort_name: str,
     horizon_days: int = RISK_HORIZON_DAYS,
@@ -467,6 +505,7 @@ def extract_unified_cohort(
         master_data = load_pancan_master_data(horizon_days=horizon_days)
         if master_data is not None:
             X_m, y_m, t_m, e_m = master_data
+            X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
             all_X.append(X_m)
             all_y.append(y_m)
             all_time.append(t_m)
@@ -480,6 +519,7 @@ def extract_unified_cohort(
             log.info("  Loading clinical genomics for: TCGA-%s...", c)
             try:
                 X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
+                X_sub, y_sub, t_sub, e_sub = clean_matrix_axes(X_sub, y_sub, t_sub, e_sub, prefix=f"TCGA_{c}")
 
                 # Batch normalization across organ cohorts to eliminate tissue-specific baseline offsets
                 if len(cancer_codes) > 1 and normalize_batches and len(X_sub) > 1:
@@ -505,14 +545,17 @@ def extract_unified_cohort(
                 meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
                 g_cols = [c for c in df_mb.columns if c not in meta_cols]
                 X_mb = df_mb[g_cols]
+                X_mb, y_mb, t_mb, e_mb = clean_matrix_axes(
+                    X_mb, df_mb["_Y_3YR"], df_mb["_TIME_DAYS"], df_mb["_EVENT"], prefix="METABRIC"
+                )
                 if normalize_batches and len(X_mb) > 1:
                     stds = X_mb.std(axis=0)
                     stds[stds < 1e-6] = 1.0
                     X_mb = (X_mb - X_mb.mean(axis=0)) / stds
                 all_X.append(X_mb)
-                all_y.append(df_mb["_Y_3YR"])
-                all_time.append(df_mb["_TIME_DAYS"])
-                all_event.append(df_mb["_EVENT"])
+                all_y.append(y_mb)
+                all_time.append(t_mb)
+                all_event.append(e_mb)
             except Exception as e:
                 log.warning("Could not include METABRIC in consolidated flow: %s", e)
 
@@ -524,14 +567,17 @@ def extract_unified_cohort(
                 meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
                 g_cols = [c for c in df_gse.columns if c not in meta_cols]
                 X_gse = df_gse[g_cols]
+                X_gse, y_gse, t_gse, e_gse = clean_matrix_axes(
+                    X_gse, df_gse["_Y_3YR"], df_gse["_TIME_DAYS"], df_gse["_EVENT"], prefix="GSE31210"
+                )
                 if normalize_batches and len(X_gse) > 1:
                     stds = X_gse.std(axis=0)
                     stds[stds < 1e-6] = 1.0
                     X_gse = (X_gse - X_gse.mean(axis=0)) / stds
                 all_X.append(X_gse)
-                all_y.append(df_gse["_Y_3YR"])
-                all_time.append(df_gse["_TIME_DAYS"])
-                all_event.append(df_gse["_EVENT"])
+                all_y.append(y_gse)
+                all_time.append(t_gse)
+                all_event.append(e_gse)
             except Exception as e:
                 log.warning("Could not include GSE31210 in consolidated flow: %s", e)
 
