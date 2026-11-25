@@ -141,7 +141,7 @@ def find_model_artifact(requested_model: str, dataset: str = "") -> Tuple[Option
 def main():
     parser = argparse.ArgumentParser(description="Cross-Cohort External Clinical Validation Runner")
     parser.add_argument("--model", type=str, default="auto", help="Model cohort identifier (e.g. TCGA-PAN-RENAL, TCGA-PAN-CANCER-ALL, or 'auto')")
-    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "metabric", "gse31210"], help="External dataset")
+    parser.add_argument("--dataset", type=str, default="metabric", choices=["metabric", "gse31210"], help="External dataset (metabric or gse31210)")
     args = parser.parse_args()
 
     artifact_path, project_id, available = find_model_artifact(args.model, dataset=args.dataset)
@@ -163,8 +163,8 @@ def main():
         X_ext, y_ext, t_ext, e_ext = fetch_geo_gse31210()
         cohort_name = "GSE31210 (Lung Adenocarcinoma)"
     else:
-        X_ext, y_ext, t_ext, e_ext = generate_synthetic_external_cohort(n_samples=180, seed=42)
-        cohort_name = "Independent Synthetic Benchmark"
+        log.error("Unsupported dataset: %s. Must be 'metabric' or 'gse31210'", args.dataset)
+        sys.exit(1)
 
     log.info("Running out-of-distribution clinical risk validation against %s ...", cohort_name)
     report = evaluate_clinical_model_on_external_cohort(

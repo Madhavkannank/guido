@@ -184,8 +184,8 @@ def fetch_metabric(
         return X_df, y_series, time_series, event_series
 
     except Exception as e:
-        logger.warning("Could not download live METABRIC (%s). Falling back to synthetic external cohort.", e)
-        return generate_synthetic_external_cohort(n_samples=180, seed=101)
+        logger.error("Failed to download live METABRIC cohort: %s", e)
+        raise RuntimeError(f"Failed to download live METABRIC cohort from cBioPortal: {e}") from e
 
 
 def _load_gpl570_probe_mapping() -> Dict[str, str]:
@@ -331,5 +331,5 @@ def fetch_geo_gse31210(
         return X_df, y_series, time_series, event_series
 
     except Exception as exc:
-        logger.warning("Could not download live GSE31210 (%s). Falling back to synthetic external cohort.", exc)
-        return generate_synthetic_external_cohort(n_samples=226, seed=202)
+        logger.error("Failed to download live GSE31210 cohort: %s", exc)
+        raise RuntimeError(f"Failed to download live GSE31210 cohort from NCBI GEO: {exc}") from exc
