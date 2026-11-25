@@ -46,17 +46,80 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(
 log = logging.getLogger(__name__)
 
 
+def find_model_artifact(requested_model: str) -> Tuple[Optional[Path], str, List[str]]:
+    """
+    Resolves the model artifact path by checking local and Google Drive locations,
+    handling aliases, and falling back to enclosing pan-cancer/pan-organ models.
+    """
+    search_dirs = [
+        ROOT / "models_artifacts",
+        Path("/content/drive/MyDrive/GUIDO_5TB_DATA/models_artifacts"),
+    ]
+    search_dirs = [d for d in search_dirs if d.exists()]
+
+    available_models: Dict[str, Path] = {}
+    for d in search_dirs:
+        for p in d.glob("*/xgboost_clinical_model.joblib"):
+            m_id = p.parent.name
+            if m_id not in available_models:
+                available_models[m_id] = p
+
+    all_ids = sorted(list(available_models.keys()))
+    clean_req = requested_model.strip()
+
+    if clean_req.lower() == "auto":
+        if "TCGA-PAN-CANCER-ALL" in available_models:
+            return available_models["TCGA-PAN-CANCER-ALL"], "TCGA-PAN-CANCER-ALL", all_ids
+        if available_models:
+            chosen = all_ids[0]
+            return available_models[chosen], chosen, all_ids
+        return None, "", all_ids
+
+    project_id = clean_req if clean_req.startswith("TCGA-") else f"TCGA-{clean_req}"
+    if project_id in available_models:
+        return available_models[project_id], project_id, all_ids
+
+    # Case-insensitive match
+    for m_id, path in available_models.items():
+        if m_id.upper() == project_id.upper():
+            return path, m_id, all_ids
+
+    # Organ and Pan-Cancer fallbacks
+    ORGAN_FALLBACKS = {
+        "KIRP": "TCGA-PAN-RENAL", "KIRC": "TCGA-PAN-RENAL", "KICH": "TCGA-PAN-RENAL",
+        "LUAD": "TCGA-PAN-LUNG",  "LUSC": "TCGA-PAN-LUNG",
+        "BRCA": "TCGA-PAN-BREAST",
+        "COAD": "TCGA-PAN-GI",    "READ": "TCGA-PAN-GI",  "ESCA": "TCGA-PAN-GI", "STAD": "TCGA-PAN-GI",
+    }
+    short_code = clean_req.upper().replace("TCGA-", "").replace("TCGA.", "")
+    if short_code in ORGAN_FALLBACKS:
+        pan_id = ORGAN_FALLBACKS[short_code]
+        if pan_id in available_models:
+            log.info("Model '%s' not found, but found enclosing pan-organ model '%s'. Evaluating '%s'...", project_id, pan_id, pan_id)
+            return available_models[pan_id], pan_id, all_ids
+
+    if "TCGA-PAN-CANCER-ALL" in available_models:
+        log.info("Model '%s' not found, but found master Pan-Cancer model 'TCGA-PAN-CANCER-ALL'. Evaluating master model...", project_id)
+        return available_models["TCGA-PAN-CANCER-ALL"], "TCGA-PAN-CANCER-ALL", all_ids
+
+    return None, project_id, all_ids
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cross-Cohort External Clinical Validation Runner")
-    parser.add_argument("--model", type=str, default="TCGA-KIRP", help="Model cohort identifier (e.g. TCGA-KIRP, TCGA-KICH)")
+    parser.add_argument("--model", type=str, default="auto", help="Model cohort identifier (e.g. TCGA-PAN-RENAL, TCGA-PAN-CANCER-ALL, or 'auto')")
     parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "metabric", "gse31210"], help="External dataset")
     args = parser.parse_args()
 
-    project_id = args.model if args.model.startswith("TCGA-") else f"TCGA-{args.model}"
-    artifact_path = ROOT / "models_artifacts" / project_id / "xgboost_clinical_model.joblib"
+    artifact_path, project_id, available = find_model_artifact(args.model)
 
-    if not artifact_path.exists():
-        log.error("Artifact not found: %s. Please train the model first with retrain_fixed.py.", artifact_path)
+    if artifact_path is None or not artifact_path.exists():
+        log.error("Artifact not found for model: %s", args.model)
+        if available:
+            log.info("Available trained models on disk:\n  %s", "\n  ".join(f"- {m}" for m in available))
+            log.info("Run with: --model %s", available[0])
+        else:
+            log.error("No trained models found on disk or in Google Drive. Please run Cell 5 (retrain_fixed.py) first.")
         sys.exit(1)
 
     log.info("Loading external dataset: %s ...", args.dataset.upper())
