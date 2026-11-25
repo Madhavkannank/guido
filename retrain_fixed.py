@@ -352,20 +352,26 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     fname_expr = XENA_FILE.get(cancer, get_xena_tsv_name(cancer))
     path_expr = XENA_DIR / fname_expr
     path_cdr  = XENA_DIR / "TCGA_CDR_survival.tsv"
+    shards_dir = ROOT / "data" / "processed" / "shards"
+    pq_path   = shards_dir / f"TCGA_{cancer}_expression.parquet"
 
     # Automatically fetch if missing
-    if not path_expr.exists() or not path_cdr.exists():
+    if (not path_expr.exists() and not pq_path.exists()) or not path_cdr.exists():
         log.info("Missing expression or TCGA-CDR data for %s. Triggering download...", cancer)
         import download_xena_cohorts
         download_xena_cohorts.download_cohort(cancer)
 
-    if not path_expr.exists():
-        raise FileNotFoundError(f"Expression matrix missing: {path_expr}")
+    if not path_expr.exists() and not pq_path.exists():
+        raise FileNotFoundError(f"Expression matrix missing: {path_expr} or {pq_path}")
     if not path_cdr.exists():
         raise FileNotFoundError(f"TCGA-CDR matrix missing: {path_cdr}")
 
-    # Load raw RNA-Seq expression (genes x samples)
-    df_expr = pd.read_csv(path_expr, sep="\t", index_col=0, low_memory=False).dropna(how="all")
+    # Load RNA-Seq expression (prefer high-speed low-memory Parquet shard if present)
+    if pq_path.exists():
+        df_expr = pd.read_parquet(pq_path).dropna(how="all").astype(np.float32)
+    else:
+        df_expr = pd.read_csv(path_expr, sep="\t", index_col=0, low_memory=False).dropna(how="all").astype(np.float32)
+
     # Load TCGA-CDR survival table
     df_cdr  = pd.read_csv(path_cdr, sep="\t", index_col="sample", low_memory=False)
 
@@ -435,7 +441,9 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     else:
         y_series = pd.Series([1 if is_high_risk.loc[s] else 0 for s in eval_samples], index=eval_samples)
 
-    X = df_expr[eval_samples].T.fillna(0.0)
+    X = df_expr[eval_samples].T.astype(np.float32).fillna(0.0)
+    del df_expr
+    import gc; gc.collect()
 
     log.info("  Cohort TCGA-%s: %d total tumor samples -> %d landmark patients (%d High Risk / %d Low Risk at %d days)",
              cancer, len(tumor_samples), len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days)
@@ -519,7 +527,9 @@ def extract_unified_cohort(
     if not all_X:
         raise RuntimeError(f"No clinical genomic data could be loaded for cohort: {cohort_name}")
 
-    X_df = pd.concat(all_X, axis=0).fillna(0.0)
+    X_df = pd.concat(all_X, axis=0).fillna(0.0).astype(np.float32)
+    del all_X
+    import gc; gc.collect()
     y = np.concatenate([y_s.values for y_s in all_y]).astype(np.int32)
     times = np.concatenate([t_s.values for t_s in all_time]).astype(np.float32)
     events = np.concatenate([e_s.values for e_s in all_event]).astype(np.int32)
@@ -636,6 +646,10 @@ def train_strong_risk_model(
 
     X_tr_sub = X_tr[:, selected_indices]
     X_te_sub = X_te[:, selected_indices]
+
+    # Free high-dimensional full genomic matrices from RAM immediately
+    del X_raw_df, X_tr_raw, X_te_raw, X_tr_df, X_te_df, X_tr, X_te
+    import gc; gc.collect()
 
     # 5. Standard Scaling
     scaler = StandardScaler()
