@@ -19,6 +19,9 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import joblib
 
 # Add project root to sys.path
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +87,11 @@ def find_model_artifact(requested_model: str, dataset: str = "") -> Tuple[Option
     clean_req = requested_model.strip()
 
     if clean_req.lower() == "auto":
+        # Prioritize master Pan-Cancer model if trained (covers all 33 TCGA cohorts + external consortia)
+        if "TCGA-PAN-CANCER-ALL" in available_models:
+            log.info("Auto-selected master Pan-Cancer model 'TCGA-PAN-CANCER-ALL' for dataset '%s'", dataset)
+            return available_models["TCGA-PAN-CANCER-ALL"], "TCGA-PAN-CANCER-ALL", all_ids
+
         # Prioritize organ-matched model for the benchmark dataset
         DATASET_ORGAN_MAP = {
             "metabric": ["TCGA-PAN-BREAST", "TCGA-BRCA"],
@@ -95,9 +103,6 @@ def find_model_artifact(requested_model: str, dataset: str = "") -> Tuple[Option
                 log.info("Auto-selected organ-calibrated model '%s' for dataset '%s'", cand, dataset)
                 return available_models[cand], cand, all_ids
 
-        # If organ-matched model is not trained yet, use master Pan-Cancer or first available
-        if "TCGA-PAN-CANCER-ALL" in available_models:
-            return available_models["TCGA-PAN-CANCER-ALL"], "TCGA-PAN-CANCER-ALL", all_ids
         if available_models:
             chosen = all_ids[0]
             return available_models[chosen], chosen, all_ids
