@@ -46,6 +46,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(
 log = logging.getLogger(__name__)
 
 
+def is_valid_clinical_artifact(path: Path) -> bool:
+    """Verifies that an artifact is a modern calibrated clinical risk engine, not a legacy binary classifier."""
+    try:
+        art = joblib.load(path)
+        if not isinstance(art, dict):
+            return False
+        # Modern StacK-Risk / Clinical Risk artifacts have hallmark definitions or task or exactly 100 features
+        if "hallmark_metagenes" in art or "task" in art or "metagene_stats" in art:
+            return True
+        if len(art.get("features", [])) == 100:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def find_model_artifact(requested_model: str, dataset: str = "") -> Tuple[Optional[Path], str, List[str]]:
     """
     Resolves the model artifact path by checking local and Google Drive locations,
@@ -61,7 +77,7 @@ def find_model_artifact(requested_model: str, dataset: str = "") -> Tuple[Option
     for d in search_dirs:
         for p in d.glob("*/xgboost_clinical_model.joblib"):
             m_id = p.parent.name
-            if m_id not in available_models:
+            if m_id not in available_models and is_valid_clinical_artifact(p):
                 available_models[m_id] = p
 
     all_ids = sorted(list(available_models.keys()))

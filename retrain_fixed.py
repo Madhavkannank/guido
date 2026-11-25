@@ -506,6 +506,10 @@ def extract_unified_cohort(
         if master_data is not None:
             X_m, y_m, t_m, e_m = master_data
             X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
+            if normalize_batches and len(X_m) > 1:
+                stds = X_m.std(axis=0)
+                stds[stds < 1e-6] = 1.0
+                X_m = (X_m - X_m.mean(axis=0)) / stds
             all_X.append(X_m)
             all_y.append(y_m)
             all_time.append(t_m)
