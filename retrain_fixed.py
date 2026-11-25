@@ -541,11 +541,29 @@ def extract_unified_cohort(
     # Ingest external independent cohorts in single-flow if requested
     if is_global_all or include_external:
         ext_dir = ROOT / "data" / "processed" / "external"
+        ext_dir.mkdir(parents=True, exist_ok=True)
         mb_file = ext_dir / "metabric_harmonized.parquet"
+
+        # Ensure clean, uncorrupted METABRIC cohort is present
+        from src.validation.external_datasets import fetch_geo_gse31210, fetch_metabric
+        if not mb_file.exists():
+            try:
+                log.info("  Auto-fetching METABRIC cohort from cBioPortal datahub for single flow...")
+                fetch_metabric()
+            except Exception as e:
+                log.warning("Could not auto-fetch METABRIC: %s", e)
+
         if mb_file.exists():
             try:
-                log.info("  Consolidating independent cohort: METABRIC into single flow...")
                 df_mb = pd.read_parquet(mb_file)
+                # Auto-heal if cached file has legacy corrupted 100% event rate
+                if df_mb["_EVENT"].mean() > 0.80:
+                    log.warning("  Detected legacy corrupted event labels in METABRIC cache (event rate %.2f > 0.80). Re-harmonizing...", float(df_mb["_EVENT"].mean()))
+                    fetch_metabric()
+                    df_mb = pd.read_parquet(mb_file)
+
+                log.info("  Consolidating independent cohort: METABRIC into single flow (%d patients, %.1f%% true recurrence rate)...",
+                         len(df_mb), float(df_mb["_EVENT"].mean() * 100))
                 meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
                 g_cols = [c for c in df_mb.columns if c not in meta_cols]
                 X_mb = df_mb[g_cols]
@@ -564,6 +582,13 @@ def extract_unified_cohort(
                 log.warning("Could not include METABRIC in consolidated flow: %s", e)
 
         gse_file = ext_dir / "gse31210_harmonized.parquet"
+        if not gse_file.exists():
+            try:
+                log.info("  Auto-fetching NCBI GEO GSE31210 cohort for single flow...")
+                fetch_geo_gse31210()
+            except Exception as e:
+                log.warning("Could not auto-fetch GSE31210: %s", e)
+
         if gse_file.exists():
             try:
                 log.info("  Consolidating independent cohort: NCBI GEO GSE31210 into single flow...")
