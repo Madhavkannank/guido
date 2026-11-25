@@ -1,26 +1,35 @@
 """
-Step 8 – Cross-Cohort Validation
-==================================
-Evaluates the trained primary model on an independent external cohort and
-computes robustness metrics:
+Step 8 – Cross-Cohort & Independent External Validation
+======================================================
+Evaluates trained clinical genomic risk models on independent hospital and
+consortium cohorts (METABRIC, GEO GSE31210, etc.) without fine-tuning:
 
-  1. AUROC on external cohort vs internal test set (ΔAUROC)
-  2. Biomarker overlap percentage between internal and external SHAP results
-  3. Statistical significance of AUROC difference (DeLong's test approximation)
+  1. Out-of-Distribution Concordance (Harrell's C-Index)
+  2. 3-Year Landmark Discrimination (AUROC & AUPRC with Bootstrap 95% CIs)
+  3. Calibration & Reliability (Brier Score, Expected Calibration Error [ECE])
+  4. Clinical Risk Stratification (Low <35%, Moderate 35-65%, High >65%)
+  5. Feature Space & Hallmark Metagene Alignment using trained baseline statistics
 
-All results are logged to MLflow and persisted to disk.
+All validation results are persisted to disk and optionally logged to MLflow.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import joblib
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    roc_auc_score,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config.settings import MLFLOW_TRACKING_URI, RESULTS_DIR
@@ -34,6 +43,64 @@ try:
     _MLFLOW_AVAILABLE = True
 except ImportError:
     _MLFLOW_AVAILABLE = False
+
+
+# ─── High-Performance Concordance Index ──────────────────────────────────────
+
+def compute_c_index_fast(times: np.ndarray, events: np.ndarray, risk_scores: np.ndarray) -> float:
+    """Computes Harrell's C-Index handling right-censoring in O(N log N) time."""
+    times = np.asarray(times, dtype=float)
+    events = np.asarray(events, dtype=int)
+    scores = np.asarray(risk_scores, dtype=float)
+    n = len(times)
+    if n < 2:
+        return 0.5
+
+    order = np.lexsort((scores, times))
+    times = times[order]
+    events = events[order]
+    scores = scores[order]
+
+    event_indices = np.where(events == 1)[0]
+    if len(event_indices) == 0:
+        return 0.5
+
+    concordant = 0.0
+    pairs = 0
+    for idx in event_indices:
+        t_i = times[idx]
+        s_i = scores[idx]
+        valid_j = (times > t_i)
+        if not np.any(valid_j):
+            continue
+        scores_j = scores[valid_j]
+        pairs += len(scores_j)
+        concordant += float(np.sum(s_i > scores_j)) + 0.5 * float(np.sum(s_i == scores_j))
+
+    return round(float(concordant / max(pairs, 1)), 4)
+
+
+# ─── Expected Calibration Error (ECE) ────────────────────────────────────────
+
+def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
+    """Computes Expected Calibration Error across equal-width probability bins."""
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+
+    for i in range(n_bins):
+        bin_lower = bin_boundaries[i]
+        bin_upper = bin_boundaries[i + 1]
+        in_bin = (y_prob >= bin_lower) & (y_prob < bin_upper) if i < n_bins - 1 else (y_prob >= bin_lower) & (y_prob <= bin_upper)
+        prop_in_bin = np.mean(in_bin)
+        if prop_in_bin > 0:
+            accuracy_in_bin = np.mean(y_true[in_bin])
+            avg_confidence_in_bin = np.mean(y_prob[in_bin])
+            ece += np.abs(accuracy_in_bin - avg_confidence_in_bin) * prop_in_bin
+
+    return round(float(ece), 4)
 
 
 # ─── AUROC bootstrap CI ──────────────────────────────────────────────────────
@@ -56,111 +123,144 @@ def bootstrap_auroc_ci(
         if len(np.unique(y_b)) < 2:
             continue
         aurocs.append(roc_auc_score(y_b, p_b))
+    if not aurocs:
+        return (0.5, 0.5)
     aurocs = np.array(aurocs)
     lower = float(np.percentile(aurocs, 100 * alpha / 2))
     upper = float(np.percentile(aurocs, 100 * (1 - alpha / 2)))
-    return lower, upper
+    return round(lower, 4), round(upper, 4)
 
 
-# ─── Align feature spaces ────────────────────────────────────────────────────
+# ─── Feature & Metagene Alignment ────────────────────────────────────────────
 
-def align_features(
+def align_external_features(
     X_ext: pd.DataFrame,
-    X_internal: pd.DataFrame,
+    artifact: Dict[str, Any]
 ) -> pd.DataFrame:
     """
-    Reindex external cohort to match the internal feature set.
-    Missing genes are zero-filled; extra genes are dropped.
+    Standardizes external patient expression using training metagene_stats,
+    computes the 12 Hallmark Metagenes, and aligns columns to artifact['features'].
     """
-    missing = set(X_internal.columns) - set(X_ext.columns)
+    target_features: List[str] = artifact["features"]
+    hallmark_pathways: Dict[str, List[str]] = artifact.get("hallmark_metagenes", {})
+    metagene_stats: Dict[str, Dict[str, float]] = artifact.get("metagene_stats", {})
+
+    X_aligned = X_ext.copy()
+
+    # Compute hallmark metagenes using training baseline statistics
+    for meta_name, gene_list in hallmark_pathways.items():
+        if meta_name not in X_aligned.columns:
+            z_cols = []
+            for g in gene_list:
+                if g in X_aligned.columns:
+                    mu = metagene_stats[g]["mean"] if g in metagene_stats else float(X_aligned[g].mean())
+                    sigma = metagene_stats[g]["std"] if g in metagene_stats else 1.0
+                    z = (X_aligned[g].values - mu) / (sigma + 1e-6)
+                    z_cols.append(z)
+            if z_cols:
+                X_aligned[meta_name] = np.mean(np.column_stack(z_cols), axis=1)
+            else:
+                X_aligned[meta_name] = 0.0
+
+    # Reindex to exact 100 features in order
+    missing = set(target_features) - set(X_aligned.columns)
     if missing:
-        logger.warning(
-            "External cohort is missing %d genes (will be zero-filled): %s…",
-            len(missing), list(missing)[:5],
-        )
-    X_aligned = X_ext.reindex(columns=X_internal.columns, fill_value=0.0)
-    return X_aligned
+        logger.warning("External dataset missing %d features; filling with 0.0", len(missing))
+    X_final = X_aligned.reindex(columns=target_features, fill_value=0.0)
+    return X_final
 
 
-# ─── Cross-cohort validation ─────────────────────────────────────────────────
+# ─── Clinical External Validation Engine ─────────────────────────────────────
 
-def run_cross_cohort_validation(
-    model,
-    X_internal_test: pd.DataFrame,
-    y_internal_test: pd.Series,
+def evaluate_clinical_model_on_external_cohort(
+    model_or_artifact: Union[Path, str, Dict[str, Any]],
     X_external: pd.DataFrame,
     y_external: pd.Series,
-    internal_biomarkers: Optional[List[str]] = None,
-    external_biomarkers: Optional[List[str]] = None,
-) -> Dict:
+    times_external: pd.Series,
+    events_external: pd.Series,
+    cohort_name: str = "External-Cohort"
+) -> Dict[str, Any]:
     """
-    Evaluate model on both internal test set and external cohort.
-
-    Returns a robustness report dict.
+    Evaluates a trained clinical genomic risk model on an independent external cohort.
+    Returns a comprehensive validation scorecard.
     """
-    # Align external cohort features to internal feature space
-    X_ext_aligned = align_features(X_external, X_internal_test)
+    if isinstance(model_or_artifact, (str, Path)):
+        artifact_path = Path(model_or_artifact)
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"Model artifact not found: {artifact_path}")
+        artifact = joblib.load(artifact_path)
+    else:
+        artifact = model_or_artifact
 
-    from contextlib import nullcontext
-    ctx = mlflow.start_run(run_name="cross_cohort") if _MLFLOW_AVAILABLE else nullcontext()
-    if _MLFLOW_AVAILABLE:
-        mlflow.set_experiment("cross_cohort_validation")
+    model = artifact["model"]
+    scaler = artifact["scaler"]
+    internal_metrics = artifact.get("test_metrics", {})
 
-    with ctx:
-        # ── Internal test ──
-        if hasattr(model, "predict_proba"):
-            y_prob_int = model.predict_proba(X_internal_test)[:, 1]
-            y_prob_ext = model.predict_proba(X_ext_aligned)[:, 1]
-        else:
-            y_prob_int = model.decision_function(X_internal_test)
-            y_prob_ext = model.decision_function(X_ext_aligned)
+    # 1. Align features and compute hallmark metagenes
+    X_aligned = align_external_features(X_external, artifact)
 
-        int_metrics = compute_clf_metrics(y_internal_test.values, y_prob_int)
-        ext_metrics = compute_clf_metrics(y_external.values, y_prob_ext)
+    # 2. Scale features using internal training scaler
+    X_scaled = scaler.transform(X_aligned.values.astype(np.float32))
 
-        auroc_delta = int_metrics["auroc"] - ext_metrics["auroc"]
+    # 3. Model Inference
+    y_prob = model.predict_proba(X_scaled)[:, 1]
+    y_pred = (y_prob >= 0.50).astype(int)
 
-        # ── Bootstrap CIs ──
-        int_ci = bootstrap_auroc_ci(y_internal_test.values, y_prob_int)
-        ext_ci = bootstrap_auroc_ci(y_external.values,      y_prob_ext)
+    # 4. Out-of-Distribution Metrics
+    y_true = y_external.values.astype(int)
+    times = times_external.values.astype(float)
+    events = events_external.values.astype(int)
 
-        # ── Biomarker overlap ──
-        overlap_pct = None
-        if internal_biomarkers and external_biomarkers:
-            int_set = set(internal_biomarkers)
-            ext_set = set(external_biomarkers)
-            union = int_set | ext_set
-            overlap_pct = 100.0 * len(int_set & ext_set) / len(union) if union else 0.0
+    ext_c_idx = compute_c_index_fast(times, events, y_prob)
+    ext_auroc = round(float(roc_auc_score(y_true, y_prob)), 4) if len(np.unique(y_true)) > 1 else 0.5
+    ext_auprc = round(float(average_precision_score(y_true, y_prob)), 4) if len(np.unique(y_true)) > 1 else 0.0
+    ext_brier = round(float(brier_score_loss(y_true, y_prob)), 4)
+    ext_ece = compute_ece(y_true, y_prob, n_bins=10)
+    ext_bal_acc = round(float(balanced_accuracy_score(y_true, y_pred)), 4)
+    ext_ci = bootstrap_auroc_ci(y_true, y_prob)
 
-        report = {
-            "internal_test": {**int_metrics, "auroc_95ci": int_ci},
-            "external_cohort": {**ext_metrics, "auroc_95ci": ext_ci},
-            "auroc_delta": round(auroc_delta, 4),
-            "generalisation_flag": "PASS" if abs(auroc_delta) <= 0.10 else "WARN",
-            "biomarker_overlap_pct": round(overlap_pct, 2) if overlap_pct is not None else None,
+    # 5. Risk Stratification Tiers
+    low_risk = int(np.sum(y_prob < 0.35))
+    mod_risk = int(np.sum((y_prob >= 0.35) & (y_prob <= 0.65)))
+    high_risk = int(np.sum(y_prob > 0.65))
+
+    delta_auroc = round(internal_metrics.get("risk_auroc", ext_auroc) - ext_auroc, 4)
+    generalisation_verdict = "EXCELLENT" if abs(delta_auroc) <= 0.08 else ("ACCEPTABLE" if abs(delta_auroc) <= 0.15 else "DEGRADED")
+
+    report = {
+        "external_cohort"      : cohort_name,
+        "n_samples"            : len(y_true),
+        "n_events"             : int(np.sum(events)),
+        "internal_metrics"     : internal_metrics,
+        "external_metrics"     : {
+            "c_index"          : ext_c_idx,
+            "risk_auroc"       : ext_auroc,
+            "auroc_95ci"       : ext_ci,
+            "risk_auprc"       : ext_auprc,
+            "brier_score"      : ext_brier,
+            "ece"              : ext_ece,
+            "balanced_accuracy": ext_bal_acc,
+        },
+        "delta_auroc"          : delta_auroc,
+        "generalisation_flag"  : generalisation_verdict,
+        "risk_stratification"  : {
+            "low_risk_count"   : low_risk,
+            "moderate_risk_cnt": mod_risk,
+            "high_risk_count"  : high_risk,
         }
+    }
 
-        # Log to MLflow
-        if _MLFLOW_AVAILABLE:
-            mlflow.log_metrics({
-                "internal_auroc": int_metrics["auroc"],
-                "external_auroc": ext_metrics["auroc"],
-                "auroc_delta":    auroc_delta,
-            })
-            if overlap_pct is not None:
-                mlflow.log_metric("biomarker_overlap_pct", overlap_pct)
-            mlflow.set_tag("generalisation_flag", report["generalisation_flag"])
-
-    logger.info("Cross-cohort validation complete: %s", report)
+    logger.info("External Validation Complete on %s: C-Index=%.4f, AUROC=%.4f (Verdict: %s)",
+                cohort_name, ext_c_idx, ext_auroc, generalisation_verdict)
     return report
 
 
-def save_robustness_report(report: Dict, out_dir: Optional[Path] = None) -> Path:
-    """Persist robustness report to JSON."""
-    import json
-    out_dir = out_dir or RESULTS_DIR
+def save_validation_report(report: Dict[str, Any], project_id: str, out_dir: Optional[Path] = None) -> Path:
+    """Persists external validation report to results directory."""
+    out_dir = out_dir or (RESULTS_DIR / project_id)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "robustness_report.json"
+    cohort_slug = report.get("external_cohort", "external").lower().replace(" ", "_")
+    out_path = out_dir / f"external_validation_{cohort_slug}.json"
     out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    logger.info("Saved robustness report to %s", out_path)
+    logger.info("Saved external validation report to %s", out_path)
     return out_path

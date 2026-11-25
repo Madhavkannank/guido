@@ -31,21 +31,22 @@ GDC_ENDPOINT:    str = "https://api.gdc.cancer.gov"
 # ─── Xena (UCSC) – Alternative data source (2200+ datasets) ──────────────────
 XENA_ENDPOINT:   str = "https://xenabrowser.net/api"
 XENA_HUB:        str = os.getenv("XENA_HUB", "tcgaHub")  # tcgaHub | pancanHub | publicHub
-DATA_SOURCE:     str = os.getenv("DATA_SOURCE", "gdc")   # gdc | xena
+DATA_SOURCE:     str = os.getenv("DATA_SOURCE", "xena")  # default to xena for clinical risk survival
 
 # ─── Data preprocessing ───────────────────────────────────────────────────────
-# Number of top high-variance genes to retain after filtering
-N_TOP_GENES: int = int(os.getenv("N_TOP_GENES", "500"))
+# Number of top features (88 differential genes + 12 hallmark metagenes)
+N_TOP_GENES: int = int(os.getenv("N_TOP_GENES", "100"))
 # Genes whose per-sample variance is below this threshold are dropped first
 MIN_VARIANCE_THRESHOLD: float = float(os.getenv("MIN_VARIANCE_THRESHOLD", "0.1"))
 
-# Stratified split ratios (must sum to 1.0)
-TRAIN_RATIO: float = 0.70
-VAL_RATIO:   float = 0.15
-TEST_RATIO:  float = 0.15
+# Stratified split ratios (80/20 train/test evaluation)
+TRAIN_RATIO: float = 0.80
+VAL_RATIO:   float = 0.00
+TEST_RATIO:  float = 0.20
 
 # ─── Cross-validation ─────────────────────────────────────────────────────────
-CV_FOLDS: int = int(os.getenv("CV_FOLDS", "3"))  # Reduced from 5 for faster training
+CV_FOLDS: int = int(os.getenv("CV_FOLDS", "5"))
+
 
 # ─── SHAP biomarker extraction ────────────────────────────────────────────────
 # How many top genes to record per CV fold

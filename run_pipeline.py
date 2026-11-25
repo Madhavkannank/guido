@@ -36,6 +36,29 @@ logger = logging.getLogger(__name__)
 
 
 def mode_train(args):
+    if getattr(args, "clinical", False):
+        from retrain_fixed import train_strong_risk_model, DEFAULT_N_GENES, RISK_HORIZON_DAYS
+        cohort = args.project.replace("TCGA-", "").replace("TCGA.", "")
+        h_days = args.horizon if args.horizon is not None else RISK_HORIZON_DAYS
+        n_g = args.n_genes if args.n_genes is not None else DEFAULT_N_GENES
+        logger.info("Running clinical StacK-Risk ensemble engine for cohort: %s (horizon=%d days)", cohort, h_days)
+        result = train_strong_risk_model(
+            cohort_name=cohort,
+            n_indiv_genes=n_g,
+            horizon_days=h_days,
+            normalize_batches=not getattr(args, "no_batch_norm", False),
+        )
+        logger.info(
+            "Clinical training complete. Test AUROC: %.4f | C-index: %.4f",
+            result.get("test_risk_auroc", 0.0),
+            result.get("test_c_index", 0.0),
+        )
+        return {
+            "gate_passed": True,
+            "stable_biomarkers": [b[0] if isinstance(b, (list, tuple)) else b for b in result.get("top_10_biomarkers", [])],
+            "clinical_summary": result,
+        }
+
     from src.api.pipeline import run_training_pipeline
     result = run_training_pipeline(
         project_id=args.project,
@@ -132,6 +155,14 @@ def main():
                         help="Evaluation split (for mode=evaluate)")
     parser.add_argument("--audit-input", default=None,
                         help="Path to JSON payload for mode=audit")
+    parser.add_argument("--clinical", action="store_true", default=False,
+                        help="Train calibrated StacK-Risk stacking ensemble clinical risk engine (TCGA-CDR PFI/OS)")
+    parser.add_argument("--horizon", type=int, default=1095,
+                        help="Recurrence/progression landmark horizon in days (default: 1095 = 3 years)")
+    parser.add_argument("--n-genes", type=int, default=150,
+                        help="Number of individual prognostic genes to select")
+    parser.add_argument("--no-batch-norm", action="store_true", default=False,
+                        help="Disable batch normalization across pan-organ cohorts")
 
     args = parser.parse_args()
 

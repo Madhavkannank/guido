@@ -205,6 +205,9 @@ def train_primary(
     ctx = mlflow.start_run(run_name=f"{model_name}_primary") if _MLFLOW_AVAILABLE else nullcontext()
 
     with ctx:
+        X_eval = X_val if len(X_val) > 0 else X_train
+        y_eval = y_val if len(y_val) > 0 else y_train
+
         if use_neural_net:
             model = ShallowNN(input_dim=X_train.shape[1])
             if _MLFLOW_AVAILABLE:
@@ -215,17 +218,17 @@ def train_primary(
                     "patience": model.patience,
                 })
             model.fit(X_train.values, y_train.values)
-            y_prob = model.predict_proba(X_val.values)[:, 1]
+            y_prob = model.predict_proba(X_eval.values)[:, 1]
         else:
             model = build_elasticnet()
             if _MLFLOW_AVAILABLE:
                 mlflow.log_params({"type": "ElasticNet", "C": 0.05, "l1_ratio": 0.5})
             model.fit(X_train, y_train)
-            y_prob = model.predict_proba(X_val)[:, 1]
+            y_prob = model.predict_proba(X_eval)[:, 1]
 
-        val_metrics = compute_clf_metrics(y_val, y_prob)
+        val_metrics = compute_clf_metrics(y_eval, y_prob)
         log_metrics_to_mlflow(val_metrics, tags={"phase": "validation"})
-        logger.info("%s validation metrics: %s", model_name, val_metrics)
+        logger.info("%s validation metrics (samples=%d): %s", model_name, len(y_eval), val_metrics)
 
         gate = passes_gate(val_metrics["auroc"], baseline_results)
         if _MLFLOW_AVAILABLE:

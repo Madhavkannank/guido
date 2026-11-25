@@ -37,16 +37,82 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Disease keyword inferred from project ID (can be overridden)
 _PROJECT_DISEASE_MAP = {
+    # 33 Official TCGA Cancer Cohorts
+    "TCGA-ACC":  "adrenocortical carcinoma",
+    "TCGA-BLCA": "bladder urothelial carcinoma",
     "TCGA-BRCA": "breast cancer",
+    "TCGA-CESC": "cervical squamous cell carcinoma",
+    "TCGA-CHOL": "cholangiocarcinoma",
+    "TCGA-COAD": "colorectal cancer colon adenocarcinoma",
+    "TCGA-DLBC": "diffuse large B-cell lymphoma",
+    "TCGA-ESCA": "esophageal cancer",
+    "TCGA-GBM":  "glioblastoma multiforme",
+    "TCGA-HNSC": "head and neck squamous cell carcinoma",
+    "TCGA-KICH": "kidney chromophobe",
+    "TCGA-KIRC": "clear cell renal cell carcinoma",
+    "TCGA-KIRP": "papillary renal cell carcinoma",
+    "TCGA-LAML": "acute myeloid leukemia",
+    "TCGA-LGG":  "lower grade glioma brain tumor",
+    "TCGA-LIHC": "liver hepatocellular carcinoma",
     "TCGA-LUAD": "lung adenocarcinoma",
-    "TCGA-COAD": "colorectal cancer",
-    "TCGA-GBM":  "glioblastoma",
-    "TCGA-OV":   "ovarian cancer",
+    "TCGA-LUSC": "lung squamous cell carcinoma",
+    "TCGA-MESO": "malignant mesothelioma",
+    "TCGA-OV":   "ovarian serous cystadenocarcinoma",
+    "TCGA-PAAD": "pancreatic ductal adenocarcinoma",
+    "TCGA-PCPG": "pheochromocytoma and paraganglioma",
+    "TCGA-PRAD": "prostate adenocarcinoma",
+    "TCGA-READ": "rectum adenocarcinoma",
+    "TCGA-SARC": "sarcoma",
+    "TCGA-SKCM": "cutaneous melanoma",
+    "TCGA-STAD": "stomach gastric adenocarcinoma",
+    "TCGA-TGCT": "testicular germ cell tumor",
+    "TCGA-THCA": "thyroid carcinoma",
+    "TCGA-THYM": "thymoma",
+    "TCGA-UCEC": "uterine corpus endometrial carcinoma",
+    "TCGA-UCS":  "uterine carcinosarcoma",
+    "TCGA-UVM":  "uveal melanoma",
+    # Pan-Organ Groupings
+    "PAN-RENAL":        "renal cell carcinoma kidney cancer",
+    "PAN-LUNG":         "non-small cell lung cancer",
+    "PAN-GI":           "gastrointestinal colorectal gastric cancer",
+    "PAN-HEPATOBILIARY": "hepatobiliary liver hepatocellular carcinoma",
+    "PAN-BREAST":       "breast cancer",
+    "PAN-BRAIN":        "glioma glioblastoma brain tumor",
+    "PAN-GYN":          "gynecologic ovarian endometrial cervical cancer",
+    "PAN-UROLOGICAL":   "urological bladder prostate cancer",
+    "PAN-HEADNECK":     "head and neck cancer",
+    "PAN-ENDOCRINE":    "endocrine thyroid adrenocortical carcinoma",
+    "PAN-SARCOMA":      "sarcoma soft tissue bone",
+    "PAN-MELANOMA":     "cutaneous uveal melanoma",
+    "PAN-HEMATOLOGIC":  "hematologic leukemia lymphoma thymoma",
+    "PAN-MESO":         "malignant mesothelioma",
+}
+
+# Hallmark pathway search terms for composite metagenes
+_METAGENE_SEARCH_TERMS = {
+    "META_PROLIFERATION"        : ("MKI67 OR PCNA", "cancer cell proliferation mitosis"),
+    "META_EMT_INVASION"         : ("VIM OR CDH2", "epithelial mesenchymal transition metastasis"),
+    "META_ANGIOGENESIS"         : ("VEGFA OR KDR", "tumor angiogenesis neovascularization"),
+    "META_HYPOXIA"              : ("HIF1A OR LDHA", "tumor hypoxia microenvironment"),
+    "META_GLYCOLYSIS_WARBURG"   : ("PKM OR GAPDH", "Warburg effect aerobic glycolysis"),
+    "META_IMMUNE_EXHAUST"       : ("CD274 OR PDCD1", "T cell immune exhaustion immunotherapy checkpoint"),
+    "META_STEMNESS_PLURIPOTENCY": ("SOX2 OR POU5F1", "cancer stem cells pluripotency"),
+    "META_DNA_REPAIR"           : ("PARP1 OR BRCA1", "DNA repair homologous recombination deficiency"),
+    "META_APOPTOSIS_EVASION"    : ("BCL2 OR MCL1", "apoptosis evasion anti-apoptotic"),
+    "META_INFLAMMATION_IL6"     : ("IL6 OR STAT3", "tumor-promoting inflammation IL-6 cytokine"),
+    "META_EXTRACELLULAR_MATRIX" : ("COL1A1 OR LOX", "extracellular matrix remodeling desmoplasia"),
+    "META_OXIDATIVE_STRESS_NRF2": ("NFE2L2 OR HMOX1", "NRF2 antioxidant oxidative stress response"),
 }
 
 
 def get_disease_keyword(project_id: str = TCGA_PROJECT_ID) -> str:
-    return _PROJECT_DISEASE_MAP.get(project_id, "cancer")
+    proj = project_id.strip().upper()
+    if proj in _PROJECT_DISEASE_MAP:
+        return _PROJECT_DISEASE_MAP[proj]
+    # Check with or without TCGA- prefix
+    prefixed = f"TCGA-{proj}" if not proj.startswith("TCGA-") else proj
+    unprefixed = proj.replace("TCGA-", "").replace("TCGA.", "")
+    return _PROJECT_DISEASE_MAP.get(prefixed, _PROJECT_DISEASE_MAP.get(unprefixed, "cancer"))
 
 
 def _cache_file(gene: str, disease: str) -> Path:
@@ -62,7 +128,7 @@ def fetch_pubmed_abstracts(
 ) -> List[Dict[str, str]]:
     """
     Search PubMed for `gene disease_keyword` and return up to max_results
-    structured abstract records.
+    structured abstract records. Handles both individual genes and hallmark metagenes.
 
     Each record contains:
         pmid, title, abstract, authors, journal, year
@@ -74,7 +140,13 @@ def fetch_pubmed_abstracts(
         logger.debug("Cache hit: %s", cache)
         return json.loads(cache.read_text(encoding="utf-8"))
 
-    query = f"{gene}[Gene Name] AND {disease_keyword}[Title/Abstract]"
+    # Resolve metagene queries or standard individual gene queries
+    if gene in _METAGENE_SEARCH_TERMS:
+        genes_term, pathway_term = _METAGENE_SEARCH_TERMS[gene]
+        query = f"({genes_term}[Title/Abstract] OR {pathway_term}[Title/Abstract]) AND {disease_keyword}[Title/Abstract]"
+    else:
+        query = f"{gene}[Gene Name] AND {disease_keyword}[Title/Abstract]"
+
     try:
         # Search
         handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="relevance")

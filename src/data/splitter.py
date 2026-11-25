@@ -68,13 +68,20 @@ def split_data(
     )
 
     # Second split: val vs test (from the remaining pool)
-    relative_test = test_ratio / (val_ratio + test_ratio)
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_tmp, y_tmp,
-        test_size=relative_test,
-        stratify=y_tmp,
-        random_state=seed,
-    )
+    if val_ratio == 0.0:
+        X_val, y_val = pd.DataFrame(columns=X.columns), pd.Series(dtype=y.dtype)
+        X_test, y_test = X_tmp, y_tmp
+    elif test_ratio == 0.0:
+        X_val, y_val = X_tmp, y_tmp
+        X_test, y_test = pd.DataFrame(columns=X.columns), pd.Series(dtype=y.dtype)
+    else:
+        relative_test = test_ratio / (val_ratio + test_ratio)
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_tmp, y_tmp,
+            test_size=relative_test,
+            stratify=y_tmp,
+            random_state=seed,
+        )
 
     splits = {
         "train": (X_train, y_train),

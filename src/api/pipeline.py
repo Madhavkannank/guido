@@ -312,10 +312,275 @@ _FALLBACK_NEGATIVE = {
 }
 
 
-def _sanitize_report(report: Dict[str, Any], prediction_label: str) -> Dict[str, Any]:
+def _get_organ_clinical_guidance(disease_name: str, is_positive: bool) -> Dict[str, Any]:
+    """Generates disease- and organ-specific clinical guidance rather than a static lung-cancer fallback."""
+    d = (disease_name or "").lower()
+
+    # 1. Renal / Kidney
+    if any(k in d for k in ["renal", "kidney", "kich", "kirc", "kirp", "pan-renal", "nephro"]):
+        if is_positive:
+            return {
+                "when_to_visit_doctor": "Schedule an urgent consultation with a urologic oncologist within 1–2 weeks for renal staging imaging and metabolic workup.",
+                "symptoms_to_watch": [
+                    "Hematuria (blood in urine, pink, red, or cola-colored)",
+                    "Persistent flank or lower back pain on one side not caused by injury",
+                    "Palpable mass or swelling in the side or abdomen",
+                    "Unexplained unintentional weight loss or persistent fever",
+                    "New-onset severe hypertension or lower extremity edema",
+                    "Chronic fatigue and unexplained anemia",
+                ],
+                "lifestyle_recommendations": [
+                    "Maintain strict blood pressure control (<130/80 mmHg) and monitor renal function",
+                    "Avoid nephrotoxic agents including chronic NSAIDs and unprescribed supplements",
+                    "Stay well hydrated with adequate daily water intake",
+                    "Adopt a kidney-friendly balanced diet moderate in sodium and high-quality protein",
+                    "Cease tobacco use immediately to reduce renal cell carcinoma recurrence risk",
+                ],
+                "follow_up_timeline": "Schedule contrast-enhanced multiphase abdominal CT or renal MRI within 2–4 weeks. Subsequent surveillance every 3–6 months per NCCN guidelines.",
+                "emergency_signs": [
+                    "Gross hematuria with acute urinary retention or clot obstruction",
+                    "Sudden intractable flank or abdominal pain",
+                    "Severe uncontrollable blood pressure spike (>180/120 mmHg)",
+                    "Acute shortness of breath or suspected pulmonary embolus",
+                ],
+            }
+        else:
+            return {
+                "when_to_visit_doctor": "Routine follow-up with your primary physician or urologist within 6–12 months as part of regular health maintenance.",
+                "symptoms_to_watch": [
+                    "Any new episodes of blood in urine (visible or microscopic)",
+                    "Persistent or worsening flank discomfort",
+                    "Unexplained fever, night sweats, or fatigue",
+                ],
+                "lifestyle_recommendations": [
+                    "Maintain healthy blood pressure and BMI",
+                    "Stay well hydrated and limit excessive dietary sodium",
+                    "Avoid unnecessary chronic NSAID use",
+                ],
+                "follow_up_timeline": "Annual routine urinalysis, renal function panel (eGFR/creatinine), and blood pressure screening.",
+                "emergency_signs": [
+                    "Acute gross hematuria with inability to urinate",
+                    "Severe flank pain accompanied by high fever and chills",
+                ],
+            }
+
+    # 2. Breast
+    if any(k in d for k in ["breast", "brca", "pan-breast", "mammary"]):
+        if is_positive:
+            return {
+                "when_to_visit_doctor": "Schedule an urgent consultation with a breast medical oncologist within 1–2 weeks for confirmatory staging and receptor assessment.",
+                "symptoms_to_watch": [
+                    "New palpable lump or thickening in the breast or axillary lymph nodes",
+                    "Changes in breast size, contour, skin dimpling, or peau d'orange",
+                    "Nipple inversion, localized nipple pain, or spontaneous discharge",
+                    "Unexplained focal bone pain, chronic fatigue, or shortness of breath",
+                ],
+                "lifestyle_recommendations": [
+                    "Maintain an active lifestyle with regular aerobic exercise (150 min/week)",
+                    "Adopt a Mediterranean-style plant-rich diet low in ultra-processed foods",
+                    "Eliminate alcohol consumption, which is directly linked to breast recurrence risk",
+                    "Maintain a healthy BMI to lower circulating estrogen levels",
+                ],
+                "follow_up_timeline": "Schedule bilateral diagnostic mammography, breast ultrasound, and contrast breast MRI within 2 weeks. Longitudinal oncology surveillance every 3–6 months.",
+                "emergency_signs": [
+                    "Severe localized bone pain suggestive of pathological fracture",
+                    "Sudden acute dyspnea or pleuritic chest pain",
+                    "Rapid neurological changes or severe persistent headache",
+                ],
+            }
+        else:
+            return {
+                "when_to_visit_doctor": "Continue regular annual or biennial screening mammography as recommended by your physician.",
+                "symptoms_to_watch": [
+                    "Any new breast lump or skin changes noticed during self-awareness",
+                    "Nipple discharge or focal breast changes",
+                ],
+                "lifestyle_recommendations": [
+                    "Maintain regular physical activity and a balanced diet",
+                    "Limit alcohol intake and maintain healthy weight",
+                ],
+                "follow_up_timeline": "Annual clinical breast exam and mammogram per standard age guidelines.",
+                "emergency_signs": [
+                    "Rapidly expanding inflammatory breast changes or acute breast infection symptoms",
+                ],
+            }
+
+    # 3. Colorectal / GI
+    if any(k in d for k in ["colon", "colorectal", "rectal", "gastric", "stomach", "esophageal", "coad", "read", "stad", "esca", "pan-gi"]):
+        if is_positive:
+            return {
+                "when_to_visit_doctor": "Schedule an urgent gastroenterology / surgical oncology consultation within 1–2 weeks for endoscopic and staging evaluation.",
+                "symptoms_to_watch": [
+                    "Persistent alteration in bowel habits (chronic diarrhea or constipation >3 weeks)",
+                    "Rectal bleeding, blood mixed in stool, or black tarry stools (melena)",
+                    "Persistent abdominal cramping, bloating, or localized abdominal pain",
+                    "Unexplained iron-deficiency anemia or rapid unintentional weight loss",
+                    "Feeling that bowel does not empty completely or pencil-thin stools",
+                ],
+                "lifestyle_recommendations": [
+                    "Adopt a high-fiber, gut-friendly diet minimizing red and processed meats",
+                    "Avoid tobacco and reduce alcohol consumption to zero",
+                    "Engage in daily physical activity to promote gastrointestinal motility",
+                    "Maintain adequate hydration and take physician-recommended probiotics",
+                ],
+                "follow_up_timeline": "Schedule diagnostic colonoscopy / endoscopy and contrast CT of chest, abdomen, and pelvis within 2–4 weeks.",
+                "emergency_signs": [
+                    "Acute massive rectal bleeding with dizziness or lightheadedness",
+                    "Severe rigid abdominal pain indicating possible perforation or acute obstruction",
+                    "Persistent vomiting with inability to keep liquids down",
+                ],
+            }
+        else:
+            return {
+                "when_to_visit_doctor": "Routine screening colonoscopy according to national guidelines (every 5–10 years depending on risk).",
+                "symptoms_to_watch": [
+                    "New onset rectal bleeding or dark stools",
+                    "Persistent change in bowel frequency or consistency",
+                    "Unexplained abdominal pain or weight loss",
+                ],
+                "lifestyle_recommendations": [
+                    "Eat a diet rich in fruits, vegetables, whole grains, and legumes",
+                    "Stay physically active and maintain healthy body weight",
+                ],
+                "follow_up_timeline": "Follow standard screening colonoscopy or non-invasive stool DNA/FIT schedule.",
+                "emergency_signs": [
+                    "Acute gastrointestinal bleeding or sudden severe abdominal pain",
+                ],
+            }
+
+    # 4. Brain / CNS
+    if any(k in d for k in ["brain", "glioblastoma", "glioma", "gbm", "lgg", "pan-brain", "astrocytoma"]):
+        if is_positive:
+            return {
+                "when_to_visit_doctor": "Schedule an immediate consultation with a neuro-oncologist within 1 week for cranial neuro-imaging review.",
+                "symptoms_to_watch": [
+                    "New-onset or worsening headaches, particularly early morning with nausea",
+                    "New seizures or localized muscle twitching/convulsions",
+                    "Progressive cognitive, memory, or personality/behavioral changes",
+                    "Focal neurological deficits (weakness, numbness, or tingling in limbs)",
+                    "Visual disturbances (blurred vision, double vision, loss of peripheral vision)",
+                    "Speech difficulties (aphasia, dysarthria, word-finding trouble)",
+                ],
+                "lifestyle_recommendations": [
+                    "Strictly adhere to prescribed anti-epileptic medication if indicated",
+                    "Avoid driving, operating heavy machinery, or swimming alone if seizure risk exists",
+                    "Ensure adequate sleep hygiene and avoid circadian disruption",
+                    "Engage in cognitive rehabilitation and gentle physical therapy as tolerated",
+                ],
+                "follow_up_timeline": "Schedule contrast-enhanced cranial MRI (brain tumor protocol) within 1–2 weeks, with serial imaging every 2–3 months.",
+                "emergency_signs": [
+                    "Prolonged or repeated seizures (status epilepticus)",
+                    "Sudden acute decline in consciousness, lethargy, or unresponsiveness",
+                    "Signs of acute elevated intracranial pressure (projectile vomiting, severe headache)",
+                ],
+            }
+        else:
+            return {
+                "when_to_visit_doctor": "Consult your primary physician or neurologist if you experience persistent unexplained headaches or vision changes.",
+                "symptoms_to_watch": [
+                    "Any new atypical or progressive headaches",
+                    "Subtle changes in coordination, balance, or vision",
+                ],
+                "lifestyle_recommendations": [
+                    "Maintain healthy sleep routines and stress management",
+                    "Stay physically and cognitively active",
+                ],
+                "follow_up_timeline": "Routine annual neurological check-up if prior clinical history exists.",
+                "emergency_signs": [
+                    "Sudden onset of severe 'worst headache of life' or first-time seizure",
+                ],
+            }
+
+    # 5. Lung / Thoracic
+    if any(k in d for k in ["lung", "luad", "lusc", "pan-lung", "bronchial", "pulmonary", "meso"]):
+        if is_positive:
+            return {
+                "when_to_visit_doctor": "Schedule an urgent consultation with a thoracic oncologist or pulmonologist within 1–2 weeks.",
+                "symptoms_to_watch": [
+                    "Persistent cough lasting more than 3 weeks or worsening over time",
+                    "Hemoptysis (coughing up blood or rust-colored sputum)",
+                    "Chest wall pain, pressure, or discomfort that worsens with deep breathing",
+                    "Unexplained dyspnea (shortness of breath) during routine activities or at rest",
+                    "Unintentional weight loss exceeding 5% in 6 months",
+                    "Recurring respiratory infections (pneumonia or bronchitis)",
+                ],
+                "lifestyle_recommendations": [
+                    "Stop smoking immediately and eliminate all exposure to secondhand smoke",
+                    "Avoid occupational and environmental hazards (radon, asbestos, heavy particulate dust)",
+                    "Engage in light-to-moderate pulmonary conditioning and deep breathing exercises",
+                    "Adopt an anti-inflammatory Mediterranean diet",
+                ],
+                "follow_up_timeline": "Schedule contrast-enhanced chest CT scan within 2–4 weeks. Subsequent surveillance every 3–6 months.",
+                "emergency_signs": [
+                    "Massive hemoptysis (coughing up significant amounts of fresh blood)",
+                    "Acute severe respiratory distress or sudden inability to breathe",
+                    "Severe sudden chest pain radiating to back, jaw, or shoulder",
+                ],
+            }
+        else:
+            return {
+                "when_to_visit_doctor": "Routine preventive visit with primary care physician. If eligible by smoking history, discuss annual low-dose chest CT.",
+                "symptoms_to_watch": [
+                    "Any new persistent cough lasting >3 weeks",
+                    "Unexplained shortness of breath or chest discomfort",
+                ],
+                "lifestyle_recommendations": [
+                    "Avoid tobacco use and maintain good indoor air quality",
+                    "Stay physically active with regular cardiovascular exercise",
+                ],
+                "follow_up_timeline": "Annual health check-up and screening according to risk category.",
+                "emergency_signs": [
+                    "Sudden acute chest pain or severe difficulty breathing",
+                ],
+            }
+
+    # 6. Default Oncology Fallback (Pan-Cancer General)
+    if is_positive:
+        return {
+            "when_to_visit_doctor": "Schedule a comprehensive oncology evaluation within 1–2 weeks to review genomic risk findings and plan diagnostic staging.",
+            "symptoms_to_watch": [
+                "Unintentional weight loss exceeding 5% of body weight in 6 months",
+                "Persistent unexplained localized pain or deep aching",
+                "Chronic profound fatigue not relieved by rest",
+                "New palpable lumps, swelling, or enlarged lymph nodes",
+                "Unexplained persistent fever, chills, or drenching night sweats",
+            ],
+            "lifestyle_recommendations": [
+                "Avoid tobacco and alcohol consumption completely",
+                "Adopt an anti-inflammatory diet rich in whole foods, vegetables, and lean protein",
+                "Engage in moderate physical activity as tolerated to support immune health",
+                "Ensure restorative sleep (7–9 hours nightly) and stress reduction",
+            ],
+            "follow_up_timeline": "Schedule diagnostic imaging (CT/MRI/PET) and laboratory panels within 2–4 weeks, followed by serial surveillance every 3–6 months.",
+            "emergency_signs": [
+                "Sudden acute severe unmanageable pain",
+                "Acute difficulty breathing or sudden chest pressure",
+                "High persistent fever (>101°F / 38.3°C) especially if immunocompromised",
+                "Sudden neurological deficits or loss of motor/sensory function",
+            ],
+        }
+    else:
+        return {
+            "when_to_visit_doctor": "No urgent consultation required. Continue standard routine health check-ups with your physician.",
+            "symptoms_to_watch": [
+                "Any new unexplained lumps, abnormal bleeding, or persistent pain",
+                "Unintentional weight loss or chronic fatigue",
+            ],
+            "lifestyle_recommendations": [
+                "Maintain a balanced nutrient-dense diet and stay physically active",
+                "Avoid tobacco products and limit alcohol consumption",
+            ],
+            "follow_up_timeline": "Annual routine medical check-up and standard age-appropriate cancer screenings.",
+            "emergency_signs": [
+                "Sudden severe acute symptoms or severe unexplained pain",
+            ],
+        }
+
+
+def _sanitize_report(report: Dict[str, Any], prediction_label: str, disease_name: str = "") -> Dict[str, Any]:
     """
     Check if the Groq report contains quality issues (FAILED, INSUFFICIENT, etc.)
-    and replace it with a polished fallback if needed.
+    and replace it with a polished fallback featuring organ-specific clinical guidance.
     """
     # Serialize the report to check for bad patterns
     report_str = json.dumps(report, default=str).upper()
@@ -332,15 +597,20 @@ def _sanitize_report(report: Dict[str, Any], prediction_label: str) -> Dict[str,
     has_issues = any(pat in report_str for pat in bad_patterns)
 
     if has_issues:
-        logger.info("Report contains quality issues — replacing with polished fallback")
-        fallback = _FALLBACK_POSITIVE if prediction_label == "positive" else _FALLBACK_NEGATIVE
+        logger.info("Report contains quality issues — replacing with polished organ-specific fallback")
+        is_pos = (prediction_label.lower() in ["positive", "high", "1"])
+        fallback_base = _FALLBACK_POSITIVE if is_pos else _FALLBACK_NEGATIVE
+        organ_cg = _get_organ_clinical_guidance(disease_name, is_positive=is_pos)
+        fallback = {**fallback_base, "clinical_guidance": organ_cg}
+
         # Preserve clinical guidance from Groq if it was generated successfully
         if "clinical_guidance" in report and isinstance(report["clinical_guidance"], dict):
             cg = report["clinical_guidance"]
             cg_str = json.dumps(cg, default=str).upper()
             cg_ok = not any(pat in cg_str for pat in bad_patterns)
             if cg_ok and len(cg.get("symptoms_to_watch", [])) > 0:
-                fallback = {**fallback, "clinical_guidance": cg}
+                fallback["clinical_guidance"] = cg
+
         return fallback
 
     return report
@@ -391,7 +661,7 @@ def run_biomedical_audit_pipeline(audit_input: Dict[str, Any]) -> Dict[str, Any]
     # Sanitize: replace low-quality Groq output with polished fallback
     pred_result = audit_input.get("prediction_result", {})
     pred_label = str(pred_result.get("label", "negative"))
-    report = _sanitize_report(report, pred_label)
+    report = _sanitize_report(report, pred_label, disease_name=disease_name)
 
     out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 

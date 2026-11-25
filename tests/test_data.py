@@ -114,6 +114,12 @@ def test_split_data_stratified():
     X = pd.DataFrame(np.random.rand(200, 10))
     y = pd.Series([0] * 130 + [1] * 70)
     splits = split_data(X, y)
-    # Check that each split has both classes
+    # Check that non-empty splits have both classes
     for name, (Xs, ys) in splits.items():
+        if len(ys) > 0:
+            assert len(ys.unique()) == 2, f"Split '{name}' is missing a class"
+
+    # Explicit 3-way split test
+    splits_3way = split_data(X, y, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15)
+    for name, (Xs, ys) in splits_3way.items():
         assert len(ys.unique()) == 2, f"Split '{name}' is missing a class"

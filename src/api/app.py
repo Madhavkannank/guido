@@ -119,19 +119,33 @@ async def ui_predict(
     import numpy as np
 
     def _do_work():
-        # load model — try clinical model first, then synthetic, then any .joblib
-        candidates = [
+        # load model — strictly load clinical genomic risk models
+        clinical_candidates = [
             MODELS_DIR / project_id / "xgboost_clinical_model.joblib",
-            MODELS_DIR / project_id / "xgboost_model.joblib",
-            MODELS_DIR / project_id / "primary_model.joblib",
         ]
-        model_path = next((p for p in candidates if p.exists()), None)
+        # Organ group fallbacks
+        ORGAN_MAP = {
+            "TCGA-KIRC": "TCGA-PAN-RENAL", "TCGA-KIRP": "TCGA-PAN-RENAL", "TCGA-KICH": "TCGA-PAN-RENAL",
+            "TCGA-LUAD": "TCGA-PAN-LUNG",  "TCGA-LUSC": "TCGA-PAN-LUNG",
+            "TCGA-COAD": "TCGA-PAN-GI",    "TCGA-STAD": "TCGA-PAN-GI",
+            "TCGA-LIHC": "TCGA-PAN-HEPATOBILIARY",
+            "TCGA-BRCA": "TCGA-PAN-BREAST",
+            "TCGA-LGG" : "TCGA-PAN-BRAIN", "TCGA-GBM": "TCGA-PAN-BRAIN",
+            "TCGA-OV"  : "TCGA-PAN-GYN",   "TCGA-UCEC": "TCGA-PAN-GYN", "TCGA-CESC": "TCGA-PAN-GYN",
+        }
+        if project_id in ORGAN_MAP:
+            clinical_candidates.append(MODELS_DIR / ORGAN_MAP[project_id] / "xgboost_clinical_model.joblib")
+
+        model_path = next((p for p in clinical_candidates if p.exists()), None)
         if model_path is None:
-            # last resort: pick any .joblib in the project folder
-            found = list((MODELS_DIR / project_id).glob("*.joblib")) if (MODELS_DIR / project_id).exists() else []
-            if not found:
-                raise FileNotFoundError(f"No model artifact found for project '{project_id}' in {MODELS_DIR / project_id}")
-            model_path = found[0]
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No calibrated clinical genomic risk model found for '{project_id}'. "
+                    "Silent fallback to legacy tumor-vs-normal models is disabled to ensure prognostic validity. "
+                    f"Please calibrate the clinical recurrence model using: py -3.12 retrain_fixed.py {project_id}"
+                ),
+            )
         model_artifact = joblib.load(model_path)
 
         # unwrap dict-based artifacts: {'model': estimator, 'scaler': scaler, 'features': [...]}
@@ -163,7 +177,25 @@ async def ui_predict(
         if df.shape[0] == 0:
             raise HTTPException(status_code=400, detail="Uploaded CSV/JSON is empty")
 
-        sample = df.iloc[0:1]
+        sample = df.iloc[0:1].copy()
+
+        # Compute hallmark metagenes if expected by model artifact using training baseline statistics
+        if isinstance(model_artifact, dict) and "hallmark_metagenes" in model_artifact:
+            hallmarks = model_artifact["hallmark_metagenes"]
+            meta_stats = model_artifact.get("metagene_stats", {})
+            for meta_name, gene_list in hallmarks.items():
+                if meta_name not in sample.columns:
+                    z_cols = []
+                    for g in gene_list:
+                        if g in sample.columns:
+                            mu = meta_stats[g]["mean"] if g in meta_stats else float(sample[g].mean())
+                            sigma = meta_stats[g]["std"] if g in meta_stats else 1.0
+                            z = (sample[g].values - mu) / (sigma + 1e-6)
+                            z_cols.append(z)
+                    if z_cols:
+                        sample[meta_name] = np.mean(np.column_stack(z_cols), axis=1)
+                    else:
+                        sample[meta_name] = 0.0
 
         # align features to model's expected features (no splits needed)
         splits = None
@@ -220,33 +252,72 @@ async def ui_predict(
                     pred = model.predict(X)[0]
                     prob = float(pred)
         except Exception:
-            # fallback: return error
             prob = None
 
-        prediction = {"label": "positive" if prob and prob >= 0.5 else "negative", "prob": prob, "model": str(model_path.name), "time": "0.0s"}
+        threshold = 0.5
+        if isinstance(model_artifact, dict) and "optimal_threshold" in model_artifact:
+            try:
+                threshold = float(model_artifact["optimal_threshold"])
+            except Exception:
+                threshold = 0.5
+
+        # Determine Clinical Genomic Disease Risk Tier
+        risk_score = round(float(prob * 100), 1) if prob is not None else 50.0
+        if prob is not None:
+            if prob < 0.35:
+                risk_tier = "Low Risk"
+                recommendation = "Low Disease Progression Risk: Favorable prognosis. Standard routine surveillance recommended."
+            elif prob < 0.65:
+                risk_tier = "Moderate Risk"
+                recommendation = "Intermediate Progression Risk: Elevated recurrence probability. Close periodic surveillance recommended."
+            else:
+                risk_tier = "High Risk"
+                recommendation = "High 3-Year Disease Progression Risk: Aggressive profile. Consideration for adjuvant therapy & intensified surveillance."
+        else:
+            risk_tier = "Undetermined"
+            recommendation = "Insufficient confidence to compute risk profile."
+
+        prediction = {
+            "label": risk_tier,
+            "prob": prob,
+            "risk_score": risk_score,
+            "risk_tier": risk_tier,
+            "time_horizon": "3-Year Progression & Recurrence Risk",
+            "recommendation": recommendation,
+            "threshold": threshold,
+            "model": str(model_path.name),
+            "task": "Genomic Disease Risk Prediction",
+            "time": "0.0s",
+        }
 
         # feature importances (best-effort)
         features = []
-        try:
-            # try coef_
-            est = model
-            if hasattr(model, 'steps'):
-                est = model.steps[-1][1]
-            if hasattr(est, 'coef_'):
-                coefs = np.abs(est.coef_).ravel()
-                # skip if all zeros (model not trained or overregularized)
-                if (coefs != 0).any():
-                    names = list(X.columns)
-                    pairs = sorted(zip(names, coefs), key=lambda x: -x[1])[:30]
-                    features = [{'name': n, 'value': float(v)} for n, v in pairs]
-            elif hasattr(est, 'feature_importances_'):
-                imp = est.feature_importances_
-                if (imp != 0).any():
-                    names = list(X.columns)
-                    pairs = sorted(zip(names, imp), key=lambda x: -x[1])[:30]
-                    features = [{'name': n, 'value': float(v)} for n, v in pairs]
-        except Exception:
-            features = []
+        if isinstance(model_artifact, dict) and "feature_importances" in model_artifact:
+            imp_dict = model_artifact["feature_importances"]
+            if isinstance(imp_dict, dict):
+                features = [{"name": str(k), "value": float(v)} for k, v in list(imp_dict.items())[:30]]
+
+        if not features:
+            try:
+                # try coef_
+                est = model
+                if hasattr(model, 'steps'):
+                    est = model.steps[-1][1]
+                if hasattr(est, 'coef_'):
+                    coefs = np.abs(est.coef_).ravel()
+                    # skip if all zeros (model not trained or overregularized)
+                    if (coefs != 0).any():
+                        names = list(X.columns)
+                        pairs = sorted(zip(names, coefs), key=lambda x: -x[1])[:30]
+                        features = [{'name': n, 'value': float(v)} for n, v in pairs]
+                elif hasattr(est, 'feature_importances_'):
+                    imp = est.feature_importances_
+                    if (imp != 0).any():
+                        names = list(X.columns)
+                        pairs = sorted(zip(names, imp), key=lambda x: -x[1])[:30]
+                        features = [{'name': n, 'value': float(v)} for n, v in pairs]
+            except Exception:
+                features = []
 
         # prepare audit input and run pipeline
         # Load real training stats from saved summary/stability files
@@ -313,7 +384,12 @@ async def ui_predict(
             # if audit fails, return polished fallback instead of raw error
             logger.warning("Audit pipeline error, using fallback: %s", e)
             from src.api.pipeline import _FALLBACK_POSITIVE, _FALLBACK_NEGATIVE
-            report = _FALLBACK_POSITIVE if prediction.get('label') == 'positive' else _FALLBACK_NEGATIVE
+            is_high_risk = (
+                prediction.get('risk_tier') in ('High Risk', 'Moderate Risk')
+                or prediction.get('label') in ('High Risk', 'Moderate Risk', 'positive')
+                or (prediction.get('prob') is not None and prediction['prob'] >= 0.5)
+            )
+            report = _FALLBACK_POSITIVE if is_high_risk else _FALLBACK_NEGATIVE
 
         return {
             'prediction': prediction,
@@ -459,7 +535,11 @@ async def cross_cohort_validation(request: CrossCohortRequest):
     import joblib
 
     try:
-        model = joblib.load(MODELS_DIR / request.project_id / "primary_model.joblib")
+        model_path = (MODELS_DIR / request.project_id / "xgboost_clinical_model.joblib")
+        if not model_path.exists():
+            model_path = (MODELS_DIR / request.project_id / "primary_model.joblib")
+        model_art = joblib.load(model_path)
+        model = model_art.get('model', model_art) if isinstance(model_art, dict) else model_art
         splits = _load_splits(request.project_id)
         X_test, y_test = splits["test"]
         X_ext, y_ext = await _run_in_executor(load_external_cohort, request.external_cohort_path)

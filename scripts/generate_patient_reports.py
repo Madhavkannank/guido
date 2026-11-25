@@ -16,17 +16,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def risk_category(p: float) -> str:
-    if p < 0.2:
+# Clinical consensus risk cutoffs matching GUIDO validation & serving layer
+DEFAULT_RISK_CUTOFFS = {"low": 0.35, "high": 0.65}
+
+
+def risk_category(p: float, low_cutoff: float = 0.35, high_cutoff: float = 0.65) -> str:
+    """Classifies risk probability according to calibrated clinical consensus thresholds."""
+    if p < low_cutoff:
         return "Low"
-    if p < 0.5:
+    if p < high_cutoff:
         return "Moderate"
     return "High"
 
 
-def generate_report_row(sample_id: str, prob: float) -> dict:
+def generate_report_row(sample_id: str, prob: float, cutoffs: dict | None = None) -> dict:
     pct = round(float(prob) * 100, 1)
-    cat = risk_category(prob)
+    c_low = cutoffs.get("low", 0.35) if cutoffs else 0.35
+    c_high = cutoffs.get("high", 0.65) if cutoffs else 0.65
+    cat = risk_category(prob, low_cutoff=c_low, high_cutoff=c_high)
     report = {
         "sample_id": str(sample_id),
         "predicted_probability": float(prob),
@@ -90,9 +97,21 @@ def main(project: str):
     out_dir = Path(RESULTS_DIR) / project / "patient_reports"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Check for calibrated model artifact cutoffs
+    cutoffs = None
+    model_artifact_path = repo / "models_artifacts" / project / "xgboost_clinical_model.joblib"
+    if model_artifact_path.exists():
+        try:
+            import joblib
+            art = joblib.load(model_artifact_path)
+            cutoffs = art.get("risk_cutoffs")
+            logger.info("Using calibrated model risk cutoffs: %s", cutoffs)
+        except Exception as e:
+            logger.warning("Could not read artifact cutoffs: %s", e)
+
     reports = []
     for _, row in preds.iterrows():
-        rpt = generate_report_row(row.get("sample_id", "unknown"), float(row["y_prob"]))
+        rpt = generate_report_row(row.get("sample_id", "unknown"), float(row["y_prob"]), cutoffs=cutoffs)
         reports.append(rpt)
         # write per-sample report (JSON) without raw features
         sid = str(row.get("sample_id", "sample"))

@@ -179,30 +179,52 @@ def align_and_label(
     
     X = expr[common_samples].T  # samples × genes
     
-    # Try to find a binary outcome column
-    if label_col in phenotypes.columns:
-        y = phenotypes.loc[common_samples, label_col]
+    # Try to find a standardized clinical survival/outcome column
+    candidate_cols = [
+        label_col, "PFI", "OS", "vital_status", "_EVENT", "DFS", "RFS",
+        "recurrence_status", "disease_free_status", "vital_status.demographic"
+    ]
+    matched_col = None
+    for c in candidate_cols:
+        if c in phenotypes.columns:
+            matched_col = c
+            break
+
+    if matched_col is not None:
+        y_raw = phenotypes.loc[common_samples, matched_col]
+        label_col = matched_col
     else:
-        # Fallback: use first non-null binary column
+        # Fallback: search for any binary column
         for col in phenotypes.columns:
-            if phenotypes[col].dtype == 'object' or phenotypes[col].nunique() == 2:
-                y = phenotypes.loc[common_samples, col]
+            if phenotypes[col].dropna().nunique() == 2:
+                y_raw = phenotypes.loc[common_samples, col]
                 label_col = col
                 break
         else:
-            logger.warning("Could not find suitable label column; using random binary labels")
-            y = pd.Series(np.random.randint(0, 2, len(common_samples)), index=common_samples)
-    
-    # Convert to binary (0/1)
-    if y.dtype == 'object':
-        # Try common patterns: "yes"/"no", "true"/"false", "event"/"no_event"
-        y_lower = y.str.lower()
-        if (y_lower == "yes").any() or (y_lower == "true").any() or (y_lower == "event").any():
-            y = ((y_lower.isin(["yes", "true", "event", "alive"])) | (y_lower == "1")).astype(int)
+            raise ValueError(
+                f"No valid clinical outcome or survival label column found in phenotypes. "
+                f"Checked candidates: {candidate_cols}. Available columns: {list(phenotypes.columns)[:20]}"
+            )
+
+    # Standardize oncology event coding (1 = Disease Event / Deceased / Recurred, 0 = Event-Free / Alive)
+    if y_raw.dtype == 'object':
+        y_lower = y_raw.astype(str).str.strip().str.lower()
+        event_markers = {"dead", "deceased", "recurred", "relapsed", "progressed", "event", "yes", "true", "1", "1.0"}
+        free_markers  = {"alive", "disease free", "progression free", "no event", "censored", "no", "false", "0", "0.0"}
+
+        if y_lower.isin(event_markers).any() or y_lower.isin(free_markers).any():
+            y = y_lower.isin(event_markers).astype(int)
         else:
-            y = (y_lower.isin([y_lower.unique()[0]])).astype(int)
+            # Map minority class to 1 if binary categories are arbitrary
+            unique_vals = y_lower.dropna().unique()
+            if len(unique_vals) == 2:
+                val_counts = y_lower.value_counts()
+                event_val = val_counts.index[-1]  # rare class as event
+                y = (y_lower == event_val).astype(int)
+            else:
+                raise ValueError(f"Unable to resolve binary event mapping for column '{label_col}'. Values: {unique_vals}")
     else:
-        y = y.astype(int)
+        y = y_raw.fillna(0).astype(int)
     
     y.name = "label"
     return X, y
