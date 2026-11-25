@@ -240,7 +240,12 @@ def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str =
 
     X = expr[common_patients].T  # samples × genes
     y_raw = clinical.loc[common_patients, label_col]
-    y = (y_raw.str.lower() == "dead").astype(int)
+    if pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == "object":
+        y_lower = y_raw.astype(str).str.strip().str.lower()
+        event_markers = {"dead", "deceased", "recurred", "relapsed", "progressed", "event", "yes", "true", "1", "1.0"}
+        y = y_lower.isin(event_markers).astype(int)
+    else:
+        y = (y_raw != 0).astype(int)
     y.name = "label"
     return X, y
 

@@ -245,6 +245,7 @@ def evaluate_clinical_model_on_external_cohort(
         "generalisation_flag"  : generalisation_verdict,
         "risk_stratification"  : {
             "low_risk_count"   : low_risk,
+            "moderate_risk_count": mod_risk,
             "moderate_risk_cnt": mod_risk,
             "high_risk_count"  : high_risk,
         }

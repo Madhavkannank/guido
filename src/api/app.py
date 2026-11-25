@@ -120,21 +120,34 @@ async def ui_predict(
 
     def _do_work():
         # load model — strictly load clinical genomic risk models
+        norm_proj = project_id.strip().upper()
+        prefixed_proj = f"TCGA-{norm_proj}" if not norm_proj.startswith("TCGA-") else norm_proj
+        unprefixed_proj = norm_proj.replace("TCGA-", "").replace("TCGA.", "")
+
         clinical_candidates = [
             MODELS_DIR / project_id / "xgboost_clinical_model.joblib",
+            MODELS_DIR / prefixed_proj / "xgboost_clinical_model.joblib",
+            MODELS_DIR / unprefixed_proj / "xgboost_clinical_model.joblib",
         ]
         # Organ group fallbacks
         ORGAN_MAP = {
             "TCGA-KIRC": "TCGA-PAN-RENAL", "TCGA-KIRP": "TCGA-PAN-RENAL", "TCGA-KICH": "TCGA-PAN-RENAL",
             "TCGA-LUAD": "TCGA-PAN-LUNG",  "TCGA-LUSC": "TCGA-PAN-LUNG",
-            "TCGA-COAD": "TCGA-PAN-GI",    "TCGA-STAD": "TCGA-PAN-GI",
-            "TCGA-LIHC": "TCGA-PAN-HEPATOBILIARY",
+            "TCGA-COAD": "TCGA-PAN-GI",    "TCGA-READ": "TCGA-PAN-GI", "TCGA-STAD": "TCGA-PAN-GI", "TCGA-ESCA": "TCGA-PAN-GI",
+            "TCGA-LIHC": "TCGA-PAN-HEPATOBILIARY", "TCGA-CHOL": "TCGA-PAN-HEPATOBILIARY",
             "TCGA-BRCA": "TCGA-PAN-BREAST",
             "TCGA-LGG" : "TCGA-PAN-BRAIN", "TCGA-GBM": "TCGA-PAN-BRAIN",
-            "TCGA-OV"  : "TCGA-PAN-GYN",   "TCGA-UCEC": "TCGA-PAN-GYN", "TCGA-CESC": "TCGA-PAN-GYN",
+            "TCGA-OV"  : "TCGA-PAN-GYN",   "TCGA-UCEC": "TCGA-PAN-GYN", "TCGA-CESC": "TCGA-PAN-GYN", "TCGA-UCS": "TCGA-PAN-GYN",
+            "TCGA-BLCA": "TCGA-PAN-UROLOGICAL", "TCGA-PRAD": "TCGA-PAN-UROLOGICAL",
+            "TCGA-HNSC": "TCGA-PAN-HEADNECK",
+            "TCGA-THCA": "TCGA-PAN-ENDOCRINE", "TCGA-ACC": "TCGA-PAN-ENDOCRINE", "TCGA-PCPG": "TCGA-PAN-ENDOCRINE",
+            "TCGA-SARC": "TCGA-PAN-SARCOMA",
+            "TCGA-SKCM": "TCGA-PAN-MELANOMA", "TCGA-UVM": "TCGA-PAN-MELANOMA",
+            "TCGA-LAML": "TCGA-PAN-HEMATOLOGIC", "TCGA-DLBC": "TCGA-PAN-HEMATOLOGIC", "TCGA-THYM": "TCGA-PAN-HEMATOLOGIC",
+            "TCGA-MESO": "TCGA-PAN-MESO",
         }
-        if project_id in ORGAN_MAP:
-            clinical_candidates.append(MODELS_DIR / ORGAN_MAP[project_id] / "xgboost_clinical_model.joblib")
+        if prefixed_proj in ORGAN_MAP:
+            clinical_candidates.append(MODELS_DIR / ORGAN_MAP[prefixed_proj] / "xgboost_clinical_model.joblib")
 
         model_path = next((p for p in clinical_candidates if p.exists()), None)
         if model_path is None:
@@ -235,7 +248,8 @@ async def ui_predict(
         # apply scaler if present
         if scaler is not None:
             try:
-                X_scaled = scaler.transform(X)
+                X_vals = X.values if hasattr(X, "values") else X
+                X_scaled = scaler.transform(X_vals)
                 X = pd.DataFrame(X_scaled, columns=X.columns)
             except Exception:
                 pass
@@ -243,13 +257,22 @@ async def ui_predict(
         # predict
         try:
             if hasattr(model, "predict_proba"):
-                prob = float(model.predict_proba(X)[:, 1][0])
+                try:
+                    prob = float(model.predict_proba(X.values)[:, 1][0])
+                except Exception:
+                    prob = float(model.predict_proba(X)[:, 1][0])
             else:
                 if hasattr(model, "decision_function"):
-                    s = model.decision_function(X)[0]
+                    try:
+                        s = model.decision_function(X.values)[0]
+                    except Exception:
+                        s = model.decision_function(X)[0]
                     prob = float(1 / (1 + np.exp(-s)))
                 else:
-                    pred = model.predict(X)[0]
+                    try:
+                        pred = model.predict(X.values)[0]
+                    except Exception:
+                        pred = model.predict(X)[0]
                     prob = float(pred)
         except Exception:
             prob = None

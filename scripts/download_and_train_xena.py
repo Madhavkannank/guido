@@ -95,11 +95,13 @@ def download_until_target(cohort: str, target_samples: int, hub: str = "tcgaHub"
     return downloaded
 
 
-def run_training_for_dataset(dataset_id: str):
+def run_training_for_dataset(dataset_id: str, clinical: bool = True):
     cmd = [
         sys.executable, "run_pipeline.py", "--mode", "train", "--real-data",
         "--data-source", "xena", "--xena-dataset", dataset_id
     ]
+    if clinical:
+        cmd.append("--clinical")
     logger.info("Running training: %s", " ".join(cmd))
     subprocess.run(cmd, check=False)
 
@@ -108,6 +110,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--projects", nargs="+", required=True)
     parser.add_argument("--hub", default="tcgaHub")
+    parser.add_argument("--clinical", action="store_true", default=True, help="Use StacK-Risk clinical risk engine")
     args = parser.parse_args()
 
     for proj in args.projects:
@@ -126,26 +129,9 @@ def main():
             logger.warning("No datasets downloaded for %s — skipping training", proj)
             continue
 
-        # Choose the largest downloaded dataset by sample count (attempt to read)
-        best = None
-        best_samples = 0
-        for ds in downloaded:
-            try:
-                # read small preview to count columns
-                df = download_matrix(ds, args.hub)
-                if df is None:
-                    continue
-                if df.shape[1] > best_samples:
-                    best_samples = df.shape[1]
-                    best = ds
-            except Exception:
-                continue
-
-        if not best:
-            best = downloaded[0]
-
-        logger.info("Starting training on best dataset for %s: %s (%d samples)", proj, best, best_samples)
-        run_training_for_dataset(best)
+        best = downloaded[0]
+        logger.info("Starting training on dataset for %s: %s", proj, best)
+        run_training_for_dataset(best, clinical=args.clinical)
 
 
 if __name__ == "__main__":

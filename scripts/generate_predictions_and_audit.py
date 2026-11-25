@@ -20,37 +20,58 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def main(project: str, disease_name: str = "lung adenocarcinoma"):
+def main(project: str, disease_name: str | None = None):
     repo_root = Path(__file__).resolve().parents[1]
     import sys
     sys.path.insert(0, str(repo_root))
 
     from src.api.pipeline import _load_splits, run_biomedical_audit_pipeline
+    from src.literature.pubmed_retrieval import get_disease_keyword
     from config.settings import MODELS_DIR, RESULTS_DIR
 
-    model_path = MODELS_DIR / project / "primary_model.joblib"
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model artifact not found: {model_path}")
+    if not disease_name or disease_name == "lung adenocarcinoma":
+        disease_name = get_disease_keyword(project)
+
+    # Search for clinical risk model first, then legacy primary models
+    model_candidates = [
+        MODELS_DIR / project / "xgboost_clinical_model.joblib",
+        MODELS_DIR / project / "primary_model.joblib",
+        MODELS_DIR / project / "ElasticNet.joblib",
+        MODELS_DIR / project / "ShallowNN.joblib",
+        MODELS_DIR / project / "xgboost_model.joblib",
+    ]
+    model_path = next((p for p in model_candidates if p.exists()), None)
+    if not model_path:
+        raise FileNotFoundError(f"Model artifact not found in {MODELS_DIR / project}")
 
     logger.info("Loading model from %s", model_path)
-    model = joblib.load(model_path)
+    model_raw = joblib.load(model_path)
+    model = model_raw.get("model", model_raw) if isinstance(model_raw, dict) else model_raw
+    scaler = model_raw.get("scaler", None) if isinstance(model_raw, dict) else None
 
     splits = _load_splits(project)
     X_test, y_test = splits["test"]
 
     logger.info("Predicting probabilities on test set (%d samples)", X_test.shape[0])
+    X_in = X_test
+    if scaler is not None:
+        try:
+            X_in = scaler.transform(X_test.values)
+        except Exception:
+            pass
+
     # predict_proba may not exist for some models; handle gracefully
     try:
-        y_prob = model.predict_proba(X_test)[:, 1]
+        y_prob = model.predict_proba(X_in)[:, 1]
     except Exception:
         # fallback to decision_function or predict
         if hasattr(model, "decision_function"):
-            scores = model.decision_function(X_test)
+            scores = model.decision_function(X_in)
             # map to [0,1]
             import numpy as np
             y_prob = 1 / (1 + np.exp(-scores))
         else:
-            y_prob = model.predict(X_test)
+            y_prob = model.predict(X_in)
 
     import numpy as np
     y_pred = (y_prob >= 0.5).astype(int)
@@ -132,6 +153,6 @@ def main(project: str, disease_name: str = "lung adenocarcinoma"):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--project', required=True)
-    parser.add_argument('--disease', default='lung adenocarcinoma')
+    parser.add_argument('--disease', default=None, help="Disease name (default: auto-detected from project ID)")
     args = parser.parse_args()
     main(args.project, args.disease)

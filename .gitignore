@@ -31,6 +31,9 @@ data/processed/
 
 # ── Model artifacts (large binaries) ─────────────────────────────────────────
 # models_artifacts/ — committed to repo (served from container)
+models_artifacts/*/splits/
+models_artifacts/*/ElasticNet.joblib
+models_artifacts/*/primary_model.joblib
 
 # ── Results (regeneratable caches only) ───────────────────────────────────────
 results/pubmed_cache/
@@ -47,6 +50,7 @@ mlruns/
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
+!notebooks/*.ipynb
 
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/

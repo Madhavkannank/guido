@@ -478,7 +478,7 @@ def train_strong_risk_model(
     log.info("  Configuring Stacking Ensemble (ElasticNet + XGBoost [scale_pos=%.2f] + ExtraTrees)...", scale_pos_weight)
     base_models = [
         ("elasticnet", LogisticRegression(
-            solver="saga", l1_ratio=0.5, C=0.3, max_iter=2500, random_state=seed
+            solver="saga", l1_ratio=0.5, C=0.3, max_iter=4000, random_state=seed
         )),
         ("xgboost", XGBClassifier(
             n_estimators=180, max_depth=3, learning_rate=0.03, subsample=0.8,

@@ -45,7 +45,6 @@ def build_elasticnet(C: float = 0.05, l1_ratio: float = 0.5) -> Pipeline:
     return Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(
-            penalty="elasticnet",
             solver="saga",
             l1_ratio=l1_ratio,
             C=C,

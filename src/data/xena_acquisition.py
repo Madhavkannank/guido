@@ -207,7 +207,7 @@ def align_and_label(
             )
 
     # Standardize oncology event coding (1 = Disease Event / Deceased / Recurred, 0 = Event-Free / Alive)
-    if y_raw.dtype == 'object':
+    if pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == 'object':
         y_lower = y_raw.astype(str).str.strip().str.lower()
         event_markers = {"dead", "deceased", "recurred", "relapsed", "progressed", "event", "yes", "true", "1", "1.0"}
         free_markers  = {"alive", "disease free", "progression free", "no event", "censored", "no", "false", "0", "0.0"}

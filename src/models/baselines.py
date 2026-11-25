@@ -74,7 +74,6 @@ def build_xgboost(n_estimators: int = 200, max_depth: int = 4, learning_rate: fl
         learning_rate=learning_rate,
         subsample=0.8,
         colsample_bytree=0.8,
-        use_label_encoder=False,
         eval_metric="logloss",
         random_state=RANDOM_SEED,
         n_jobs=-1,

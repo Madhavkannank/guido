@@ -8,11 +8,12 @@
 // GBM has only 5 normal samples → insufficient for a reliable stratified split (excluded).
 
 export const cancerTypes = [
-  'BRCA','COAD','GBM','KICH','KIRC','KIRP','LGG','LIHC','LUAD','LUSC','PAAD','PRAD','SKCM'
+  'PAN-RENAL', 'BRCA','COAD','GBM','KICH','KIRC','KIRP','LGG','LIHC','LUAD','LUSC','PAAD','PRAD','SKCM'
 ]
 
 // XGBoost synthetic-label models  (results/TCGA-*/xgboost_summary.json)
 export const syntheticAUROC = {
+  'PAN-RENAL': 0.500,
   BRCA: 0.495, COAD: 0.483, GBM: 0.214, KICH: 0.510,
   KIRC: 0.677, KIRP: 0.535, LGG: 0.481, LIHC: 0.535,
   LUAD: 0.419, LUSC: 0.503, PAAD: 0.472, PRAD: 0.472, SKCM: 0.460,
@@ -22,6 +23,7 @@ export const syntheticAUROC = {
 // (results/TCGA-*/xgboost_clinical_summary.json → test_auroc)
 // GBM excluded: only 5 normal samples total — insufficient for a reliable split.
 export const clinicalAUROC = {
+  'PAN-RENAL': 0.824,
   BRCA: 0.999, COAD: 1.000, KICH: 1.000,
   KIRC: 0.999, KIRP: 1.000, LIHC: 0.998, LUAD: 0.996,
   LUSC: 1.000, PRAD: 0.937,
@@ -29,6 +31,7 @@ export const clinicalAUROC = {
 
 // Sample counts
 export const sampleCounts = {
+  'PAN-RENAL': { total:  544, tumor:  174, normal: 370 },
   BRCA: { total: 1218, tumor: 1104, normal: 114 },
   COAD: { total:  329, tumor:  288, normal:  41 },
   GBM:  { total:  172, tumor:  167, normal:   5 },
@@ -47,6 +50,7 @@ export const sampleCounts = {
 // Detailed evaluation metrics — test split, from evaluation_clinical.json
 // Re-computed after applying all three training fixes.
 export const clinicalMetrics = {
+  'PAN-RENAL': { accuracy:0.7431, precision:0.6571, recall:0.6571, f1:0.6571, auroc:0.8236, specificity:0.7838, sensitivity:0.6571 },
   BRCA: { accuracy:0.9945, precision:1.0000, recall:0.9939, f1:0.9970, auroc:0.9993, specificity:1.0000, sensitivity:0.9939 },
   COAD: { accuracy:0.9800, precision:0.9778, recall:1.0000, f1:0.9888, auroc:1.0000, specificity:0.8333, sensitivity:1.0000 },
   KICH: { accuracy:0.9286, precision:0.9091, recall:1.0000, f1:0.9524, auroc:1.0000, specificity:0.7500, sensitivity:1.0000 },

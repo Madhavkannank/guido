@@ -150,7 +150,7 @@ def test_synthetic_training_and_artifact():
     X_sc = scaler.fit_transform(X)
 
     base_models = [
-        ("en", LogisticRegression(solver="saga", l1_ratio=0.5, C=0.3, max_iter=50, random_state=42)),
+        ("en", LogisticRegression(solver="saga", l1_ratio=0.5, C=0.3, max_iter=500, random_state=42)),
         ("xgb", XGBClassifier(n_estimators=10, max_depth=2, random_state=42, verbosity=0)),
         ("et", ExtraTreesClassifier(n_estimators=10, max_depth=2, random_state=42, bootstrap=True)),
     ]
