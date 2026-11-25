@@ -675,7 +675,7 @@ def train_strong_risk_model(
              elastic_iter, xgb_estimators, scale_pos_weight)
     base_models = [
         ("elasticnet", LogisticRegression(
-            solver="saga", l1_ratio=0.5, C=0.3, max_iter=elastic_iter, random_state=seed
+            penalty="elasticnet", solver="saga", l1_ratio=0.5, C=0.3, max_iter=elastic_iter, random_state=seed
         )),
         ("xgboost", XGBClassifier(
             n_estimators=xgb_estimators, max_depth=3, learning_rate=0.03, subsample=0.8,
