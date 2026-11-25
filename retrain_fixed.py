@@ -342,6 +342,99 @@ else:
 
 # ─── Data Extraction & Metagene Engineering ──────────────────────────────────
 
+def is_tumor_sample(s: str) -> bool:
+    """Identify genuine tumor biopsies (primary 01, recurrent 02, metastatic 06; exclude normal 10/11)."""
+    s = str(s).strip()
+    if s in ("sample", "_PATIENT"):
+        return False
+    parts = s.split("-")
+    if len(parts) >= 4:
+        stype = parts[3][:2]
+        if stype.isdigit():
+            code = int(stype)
+            return 1 <= code <= 9
+    return s.endswith("-01") or "-01" in s
+
+
+def load_pancan_master_data(
+    horizon_days: int = RISK_HORIZON_DAYS
+) -> Optional[Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]]:
+    """
+    Loads pre-harmonized ComBat-adjusted PanCanAtlas master expression matrix covering all 33 TCGA cohorts
+    (EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp: ~24.5 GB uncompressed text / ~3.5 GB Parquet).
+    """
+    shards_dir = ROOT / "data" / "processed" / "shards"
+    pq_path   = shards_dir / "TCGA_PANCAN_EB_ADJUST_expression.parquet"
+    tsv_path  = XENA_DIR / "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv"
+    path_cdr  = XENA_DIR / "TCGA_CDR_survival.tsv"
+
+    if not pq_path.exists() and not tsv_path.exists():
+        return None
+    if not path_cdr.exists():
+        return None
+
+    try:
+        log.info("  Found PanCanAtlas ComBat-adjusted Master Matrix! Loading all 33 TCGA cohorts in one flow...")
+        if pq_path.exists():
+            df_expr = pd.read_parquet(pq_path).dropna(how="all").astype(np.float32)
+        else:
+            df_expr = pd.read_csv(tsv_path, sep="\t", index_col=0, low_memory=False).dropna(how="all").astype(np.float32)
+
+        df_cdr = pd.read_csv(path_cdr, sep="\t", index_col="sample", low_memory=False)
+
+        tumor_samples = [c for c in df_expr.columns if is_tumor_sample(c)]
+        if not tumor_samples:
+            tumor_samples = [c for c in df_expr.columns if c not in ("sample", "_PATIENT")]
+
+        cdr_sample_set = set(df_cdr.index)
+        sample_to_cdr = {}
+        for s in tumor_samples:
+            if s in cdr_sample_set:
+                sample_to_cdr[s] = s
+            elif s[:15] in cdr_sample_set:
+                sample_to_cdr[s] = s[:15]
+            elif s[:12] in cdr_sample_set:
+                sample_to_cdr[s] = s[:12]
+
+        valid_samples = [
+            s for s in tumor_samples
+            if s in sample_to_cdr and pd.isna(df_cdr.loc[sample_to_cdr[s], "Redaction"])
+        ]
+
+        sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
+        sub_cdr.index = valid_samples
+
+        if "PFI" in sub_cdr.columns and sub_cdr["PFI"].notna().sum() > 0:
+            event_series = sub_cdr["PFI"].fillna(0).astype(int)
+            time_series  = sub_cdr["PFI.time"].fillna(0).astype(float)
+        else:
+            event_series = sub_cdr["OS"].fillna(0).astype(int)
+            time_series  = sub_cdr["OS.time"].fillna(0).astype(float)
+
+        is_high_risk = (event_series == 1) & (time_series <= horizon_days)
+        is_low_risk  = (time_series >= horizon_days)
+        landmark_mask = is_high_risk | is_low_risk
+        eval_samples  = [s for s in valid_samples if landmark_mask.loc[s]]
+
+        if len(eval_samples) < 50:
+            log.warning("Insufficient valid landmark samples in PanCanAtlas master matrix.")
+            return None
+
+        y_series = pd.Series(0, index=eval_samples, dtype=int)
+        y_series.loc[[s for s in eval_samples if is_high_risk.loc[s]]] = 1
+
+        X = df_expr[eval_samples].T.fillna(0.0).astype(np.float32)
+        del df_expr
+        import gc; gc.collect()
+
+        log.info("  Unified PanCanAtlas Master Matrix Loaded: %d patients (%d High Risk / %d Low Risk at %d days)",
+                 len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days)
+        return X, y_series, time_series.loc[eval_samples], event_series.loc[eval_samples]
+    except Exception as e:
+        log.warning("Failed loading PanCanAtlas master matrix (%s). Falling back to individual cohorts.", e)
+        return None
+
+
 def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     Loads RNA-Seq expression and standardized TCGA-CDR clinical outcomes for a cohort.
@@ -375,20 +468,7 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     # Load TCGA-CDR survival table
     df_cdr  = pd.read_csv(path_cdr, sep="\t", index_col="sample", low_memory=False)
 
-    # Restrict to tumor samples (primary solid tumor 01, recurrent 02, blood cancer 03, metastatic 06; exclude normal 10/11)
-    def _is_tumor_sample(s: str) -> bool:
-        s = str(s).strip()
-        if s in ("sample", "_PATIENT"):
-            return False
-        parts = s.split("-")
-        if len(parts) >= 4:
-            stype = parts[3][:2]
-            if stype.isdigit():
-                code = int(stype)
-                return 1 <= code <= 9
-        return s.endswith("-01") or "-01" in s
-
-    tumor_samples = [c for c in df_expr.columns if _is_tumor_sample(c)]
+    tumor_samples = [c for c in df_expr.columns if is_tumor_sample(c)]
     if not tumor_samples:
         tumor_samples = [c for c in df_expr.columns if c not in ("sample", "_PATIENT")]
 
@@ -459,29 +539,43 @@ def extract_unified_cohort(
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
     """Loads and unifies single or pan-organ multi-cancer cohorts with optional cross-organ normalization."""
     is_global_all = cohort_name.upper() in ("PAN-CANCER-ALL", "ALL", "GLOBAL", "ALL-CONSOLIDATED")
-    cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
     all_X = []
     all_y = []
     all_time = []
     all_event = []
 
-    for c in cancer_codes:
-        log.info("  Loading clinical genomics for: TCGA-%s...", c)
-        try:
-            X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
+    # Priority 1: If training PAN-CANCER-ALL, check for unified PanCanAtlas ComBat master matrix
+    loaded_master = False
+    if is_global_all:
+        master_data = load_pancan_master_data(horizon_days=horizon_days)
+        if master_data is not None:
+            X_m, y_m, t_m, e_m = master_data
+            all_X.append(X_m)
+            all_y.append(y_m)
+            all_time.append(t_m)
+            all_event.append(e_m)
+            loaded_master = True
 
-            # Batch normalization across organ cohorts to eliminate tissue-specific baseline offsets
-            if len(cancer_codes) > 1 and normalize_batches and len(X_sub) > 1:
-                stds = X_sub.std(axis=0)
-                stds[stds < 1e-6] = 1.0
-                X_sub = (X_sub - X_sub.mean(axis=0)) / stds
+    # Priority 2: Ingest individual organ cohorts if master matrix not loaded
+    if not loaded_master:
+        cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
+        for c in cancer_codes:
+            log.info("  Loading clinical genomics for: TCGA-%s...", c)
+            try:
+                X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
 
-            all_X.append(X_sub)
-            all_y.append(y_sub)
-            all_time.append(t_sub)
-            all_event.append(e_sub)
-        except Exception as exc:
-            log.warning("Could not ingest cohort TCGA-%s: %s", c, exc)
+                # Batch normalization across organ cohorts to eliminate tissue-specific baseline offsets
+                if len(cancer_codes) > 1 and normalize_batches and len(X_sub) > 1:
+                    stds = X_sub.std(axis=0)
+                    stds[stds < 1e-6] = 1.0
+                    X_sub = (X_sub - X_sub.mean(axis=0)) / stds
+
+                all_X.append(X_sub)
+                all_y.append(y_sub)
+                all_time.append(t_sub)
+                all_event.append(e_sub)
+            except Exception as exc:
+                log.warning("Could not ingest cohort TCGA-%s: %s", c, exc)
 
     # Ingest external independent cohorts in single-flow if requested
     if is_global_all or include_external:

@@ -66,6 +66,7 @@ ALL_33_TCGA = [
 ]
 TCGA_CDR_URL  = "https://pancanatlas.xenahubs.net/download/Survival_SupplementalTable_S1_20171025_xena_sp"
 TCGA_EXPR_URL = "https://tcga.xenahubs.net/download/TCGA.{cancer}.sampleMap%2FHiSeqV2.gz"
+TCGA_PANCAN_MASTER_URL = "https://pancanatlas.xenahubs.net/download/EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.gz"
 
 # ── 2. METABRIC & GEO Endpoints ──────────────────────────────────────────────
 METABRIC_EXPR_URL = "https://media.githubusercontent.com/media/cBioPortal/datahub/master/public/brca_metabric/data_mrna_illumina_microarray.txt"
@@ -91,6 +92,9 @@ RECOUNT3_TARGET_STUDIES = [
     ("sra", "SRP009615", "15", "G026"),  # Landmark Pan-Cancer SRA study
     ("sra", "SRP045225", "25", "G029"),  # Cancer Transcriptome & Progression
     ("sra", "SRP062974", "74", "G026"),  # Lung & Colorectal recurrence study
+    ("sra", "SRP012656", "56", "G026"),  # Breast Cancer recurrence & metastasis
+    ("sra", "SRP057196", "96", "G026"),  # Gastrointestinal malignancy cohort
+    ("sra", "SRP018838", "38", "G026"),  # Urological / Renal oncogenomics
 ]
 
 
@@ -190,6 +194,36 @@ def download_tcga_all_33(raw_xena: Path, shards: Path) -> int:
 
     log.info("[DONE] TCGA Ingestion Complete: %d / %d cohorts ready in Google Drive.", success, len(ALL_33_TCGA))
     return success
+
+
+def download_pancan_master_matrix(raw_xena: Path, shards: Path) -> bool:
+    """
+    Streams and harmonizes the official PanCanAtlas ComBat-adjusted Master Expression Matrix
+    (EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.gz: ~331 MB compressed, ~24.5 GB uncompressed).
+    Contains all 11,069 TCGA patients across all 33 cancer types with batch-effects pre-harmonized.
+    """
+    log.info("=" * 70)
+    log.info("PHASE 1b: Ingesting Unified PanCanAtlas ComBat-Adjusted Master Matrix (~24.5 GB)")
+    log.info("=" * 70)
+    tsv_name = "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv"
+    dest_tsv = raw_xena / tsv_name
+    pq_name = "TCGA_PANCAN_EB_ADJUST_expression.parquet"
+    dest_pq = shards / pq_name
+
+    if dest_pq.exists() and dest_pq.stat().st_size > 100_000_000:
+        log.info("[EXISTS] Unified PanCanAtlas Parquet Shard (%d bytes)", dest_pq.stat().st_size)
+        return True
+
+    ok = stream_download(TCGA_PANCAN_MASTER_URL, dest_tsv, is_gz=True, min_size=50_000_000)
+    if ok and not dest_pq.exists():
+        try:
+            log.info("Converting %s -> %s (Snappy Parquet)...", tsv_name, pq_name)
+            df = pd.read_csv(dest_tsv, sep="\t", index_col=0, low_memory=False)
+            df.to_parquet(dest_pq, compression="snappy")
+            log.info("[PARQUET READY] %s (%,d genes x %,d patients)", dest_pq.name, df.shape[0], df.shape[1])
+        except Exception as e:
+            log.warning("PanCanAtlas master Parquet conversion note: %s", e)
+    return ok
 
 
 # ── SECTION 2: METABRIC (Breast Cancer) ──────────────────────────────────────
@@ -458,8 +492,9 @@ def download_recount3_cancer_studies(external: Path) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="GUIDO Massive Cloud Oncology Data Ingestion Engine")
-    parser.add_argument("--all", action="store_true", help="Download ALL datasets (TCGA 33, METABRIC, GEO, CPTAC, ICGC, MSK, recount3)")
+    parser.add_argument("--all", action="store_true", help="Download ALL datasets (TCGA 33, PanCanAtlas Master, METABRIC, GEO, CPTAC, ICGC, MSK, recount3)")
     parser.add_argument("--tcga", action="store_true", help="Download all 33 TCGA cohorts + TCGA-CDR")
+    parser.add_argument("--pancan-master", action="store_true", help="Download PanCanAtlas ComBat-adjusted Master Matrix (~24.5 GB)")
     parser.add_argument("--metabric", action="store_true", help="Download METABRIC breast cancer cohort")
     parser.add_argument("--geo", action="store_true", help="Download NCBI GEO GSE31210 & GSE73731")
     parser.add_argument("--cptac", action="store_true", help="Download CPTAC 8 multi-omics cancer cohorts")
@@ -470,7 +505,7 @@ def main():
     args = parser.parse_args()
 
     # If no flags specified, default to --all
-    run_all = args.all or not (args.tcga or args.metabric or args.geo or args.cptac or args.icgc or args.msk or args.recount3)
+    run_all = args.all or not (args.tcga or args.pancan_master or args.metabric or args.geo or args.cptac or args.icgc or args.msk or args.recount3)
 
     override_path = Path(args.drive_dir) if args.drive_dir else None
     raw_xena, external, shards, cptac = resolve_base_dirs(override_path)
@@ -484,6 +519,9 @@ def main():
 
     if run_all or args.tcga:
         download_tcga_all_33(raw_xena, shards)
+
+    if run_all or args.pancan_master:
+        download_pancan_master_matrix(raw_xena, shards)
 
     if run_all or args.metabric:
         download_metabric(external)
