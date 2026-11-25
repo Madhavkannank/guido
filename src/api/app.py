@@ -25,6 +25,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from config.settings import API_HOST, API_PORT
+from src.models.deep_surv import PyTorchDeepSurvClassifier
+
+# Ensure unpickling compatibility for clinical models in API
+main_mod = sys.modules.get("__main__")
+if main_mod is not None:
+    setattr(main_mod, "PyTorchDeepSurvClassifier", PyTorchDeepSurvClassifier)
 from src.api.schemas import (
     BiomedicalAuditRequest,
     BiomedicalAuditResponse,

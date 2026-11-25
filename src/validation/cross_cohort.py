@@ -33,7 +33,13 @@ from sklearn.metrics import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config.settings import MLFLOW_TRACKING_URI, RESULTS_DIR
+from src.models.deep_surv import PyTorchDeepSurvClassifier
 from src.models.metrics import compute_clf_metrics
+
+# Ensure backward unpickling compatibility across all execution contexts
+main_mod = sys.modules.get("__main__")
+if main_mod is not None:
+    setattr(main_mod, "PyTorchDeepSurvClassifier", PyTorchDeepSurvClassifier)
 
 logger = logging.getLogger(__name__)
 

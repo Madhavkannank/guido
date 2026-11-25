@@ -24,6 +24,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from src.models.deep_surv import PyTorchDeepSurvClassifier
+setattr(sys.modules["__main__"], "PyTorchDeepSurvClassifier", PyTorchDeepSurvClassifier)
+
 from src.validation.cross_cohort import (
     evaluate_clinical_model_on_external_cohort,
     save_validation_report,
