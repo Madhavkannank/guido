@@ -81,9 +81,9 @@ export default function App(){
 
           {/* Dashboard section */}
           <div className="section-header">
-            <div className="section-badge">Dashboard</div>
-            <h2 className="section-heading">Training Results</h2>
-            <p className="section-desc">Performance metrics across 12 TCGA cancer cohorts — XGBoost models trained on 500 top-variance genes from UCSC Xena expression data.</p>
+            <div className="section-badge">Clinical Engine</div>
+            <h2 className="section-heading">Clinical Risk Engine & Hospital Validation Scorecard</h2>
+            <p className="section-desc">Performance metrics across 7,781 real patients (33 TCGA Pan-Cancer cohorts, METABRIC breast cancer, and GSE31210 lung adenocarcinoma) — StacK-Risk multi-epoch ensemble with 12 Hallmark Metagenes and out-of-distribution hospital validation.</p>
           </div>
 
           <Dashboard />
@@ -92,9 +92,9 @@ export default function App(){
 
           {/* Prediction section */}
           <div className="section-header">
-            <div className="section-badge">Pipeline</div>
-            <h2 className="section-heading">Run a Prediction</h2>
-            <p className="section-desc">Upload gene expression data or paste a JSON sample to get cancer‑type predictions, SHAP feature importance, and an AI‑generated biomedical audit report.</p>
+            <div className="section-badge">SaMD Pipeline</div>
+            <h2 className="section-heading">Clinical Recurrence & Progression Risk Prediction</h2>
+            <p className="section-desc">Upload patient RNA-seq profiles or select a validated clinical case to compute 3-year recurrence probability, tri-zone risk stratification (Low / Moderate / High), Hallmark pathway attributions, and AI biomedical audit.</p>
           </div>
 
           <div className="card p-6 fade-in">

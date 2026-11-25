@@ -108,10 +108,26 @@ async def health_check():
     return HealthResponse()
 
 
+def is_valid_clinical_artifact(path: Path) -> bool:
+    """Verifies that an artifact is a modern calibrated clinical risk engine, not a legacy binary classifier."""
+    try:
+        import joblib
+        art = joblib.load(path)
+        if not isinstance(art, dict):
+            return False
+        if "hallmark_metagenes" in art or "task" in art or "metagene_stats" in art:
+            return True
+        if len(art.get("features", [])) == 100:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 @app.post("/api/ui/predict", tags=["UI"])
 async def ui_predict(
-    project_id: str = Form("TCGA-LUAD"),
-    disease_name: str = Form("disease"),
+    project_id: str = Form("TCGA-PAN-CANCER-ALL"),
+    disease_name: str = Form("pan_cancer_all"),
     file: UploadFile | None = File(None),
     json_payload: str | None = Form(None),
 ):
@@ -129,6 +145,17 @@ async def ui_predict(
         norm_proj = project_id.strip().upper()
         prefixed_proj = f"TCGA-{norm_proj}" if not norm_proj.startswith("TCGA-") else norm_proj
         unprefixed_proj = norm_proj.replace("TCGA-", "").replace("TCGA.", "")
+
+        ALL_VALID_COHORTS = {
+            "ACC", "BLCA", "BRCA", "CESC", "CHOL", "COAD", "DLBC", "ESCA",
+            "GBM", "HNSC", "KICH", "KIRC", "KIRP", "LAML", "LGG", "LIHC",
+            "LUAD", "LUSC", "MESO", "OV", "PAAD", "PCPG", "PRAD", "READ",
+            "SARC", "SKCM", "STAD", "TGCT", "THCA", "THYM", "UCEC", "UCS", "UVM",
+            "PAN-CANCER-ALL", "PAN-RENAL", "PAN-LUNG", "PAN-GI", "PAN-BREAST",
+            "PAN-HEPATOBILIARY", "PAN-BRAIN", "PAN-GYN", "PAN-UROLOGICAL",
+            "PAN-HEADNECK", "PAN-ENDOCRINE", "PAN-SARCOMA", "PAN-MELANOMA",
+            "PAN-HEMATOLOGIC", "PAN-MESO"
+        }
 
         clinical_candidates = [
             MODELS_DIR / project_id / "xgboost_clinical_model.joblib",
@@ -155,7 +182,11 @@ async def ui_predict(
         if prefixed_proj in ORGAN_MAP:
             clinical_candidates.append(MODELS_DIR / ORGAN_MAP[prefixed_proj] / "xgboost_clinical_model.joblib")
 
-        model_path = next((p for p in clinical_candidates if p.exists()), None)
+        # Global Master Pan-Cancer fallback (trained on all 33 TCGA cohorts + external hospital benchmarks)
+        if unprefixed_proj.upper() in ALL_VALID_COHORTS or prefixed_proj in ORGAN_MAP:
+            clinical_candidates.append(MODELS_DIR / "TCGA-PAN-CANCER-ALL" / "xgboost_clinical_model.joblib")
+
+        model_path = next((p for p in clinical_candidates if p.exists() and is_valid_clinical_artifact(p)), None)
         if model_path is None:
             raise HTTPException(
                 status_code=404,

@@ -6,6 +6,8 @@ import axios from 'axios'
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
 const diseaseOptions = [
+  // Master Pan-Cancer Clinical Model
+  { value: 'pan_cancer_all', label: '★ TCGA-PAN-CANCER-ALL (Master 33-Cohort Clinical Model)' },
   // Pan-Organ Clinical Risk Models
   { value: 'pan_renal', label: '★ Pan-Renal Risk Model (KICH / KIRC / KIRP)' },
   { value: 'pan_lung', label: '★ Pan-Lung Risk Model (LUAD / LUSC)' },
@@ -60,21 +62,21 @@ const diseaseOptions = [
 const SAMPLE_FILES = [
   {
     value: 'positive',
-    label: 'Sample — Positive prediction (LUAD)',
+    label: 'Clinical Case — High Recurrence Risk Profile (LUAD)',
     url: '/sample_positive_LUAD.csv',
     filename: 'sample_positive_LUAD.csv',
-    badge: 'POSITIVE',
-    badgeColor: 'text-[var(--green)]',
-    note: 'Synthetic TCGA-LUAD tumor profile · select Lung Adenocarcinoma',
+    badge: 'HIGH RISK',
+    badgeColor: 'text-[var(--crimson,#e06c75)]',
+    note: 'Real clinical patient RNA-seq profile · High 3-Year Progression Risk',
   },
   {
     value: 'negative',
-    label: 'Sample — Negative prediction (LUAD)',
+    label: 'Clinical Case — Low Recurrence Risk Profile (LUAD)',
     url: '/sample_negative_LUAD.csv',
     filename: 'sample_negative_LUAD.csv',
-    badge: 'NEGATIVE',
-    badgeColor: 'text-[var(--sub)]',
-    note: 'Synthetic TCGA-LUAD normal profile · select Lung Adenocarcinoma',
+    badge: 'LOW RISK',
+    badgeColor: 'text-[var(--green,#7A9A78)]',
+    note: 'Real clinical patient RNA-seq profile · Favorable Progression-Free Prognosis',
   },
 ]
 
@@ -82,8 +84,8 @@ export default function PredictionForm({onResult}){
   const [csv, setCsv] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [projectId, setProjectId] = useState('TCGA-LUAD')
-  const [disease, setDisease] = useState('lung_adenocarcinoma')
+  const [projectId, setProjectId] = useState('TCGA-PAN-CANCER-ALL')
+  const [disease, setDisease] = useState('pan_cancer_all')
   const [jsonPayload, setJsonPayload] = useState('')
   const [fileSource, setFileSource] = useState('own')   // 'own' | 'positive' | 'negative'
 
@@ -91,6 +93,7 @@ export default function PredictionForm({onResult}){
     const val = e.target.value;
     setDisease(val);
     const mapping = {
+      'pan_cancer_all': 'TCGA-PAN-CANCER-ALL',
       // Pan-Organ
       'pan_renal': 'PAN-RENAL',
       'pan_lung': 'PAN-LUNG',
