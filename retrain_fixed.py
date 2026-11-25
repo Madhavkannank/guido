@@ -72,6 +72,15 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from sklearn.base import BaseEstimator, ClassifierMixin
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -111,6 +120,7 @@ XENA_FILE = {c: get_xena_tsv_name(c) for c in ALL_TCGA_COHORTS}
 
 # Organ groupings for high-power Pan-Organ risk models
 COHORT_GROUPS = {
+    "PAN-CANCER-ALL"   : ALL_TCGA_COHORTS,  # Master consolidated single-flow cross-consortium training
     "PAN-RENAL"        : ["KIRC", "KIRP", "KICH"],
     "PAN-LUNG"         : ["LUAD", "LUSC"],
     "PAN-GI"           : ["COAD", "STAD", "READ", "ESCA"],
@@ -241,6 +251,95 @@ def compute_ipcw_weights(times: np.ndarray, events: np.ndarray, horizon: float =
     return norm_weights
 
 
+# ─── Multi-Epoch Deep Clinical Risk Neural Estimator (PyTorch) ───────────────
+
+if TORCH_AVAILABLE:
+    class PyTorchDeepSurvClassifier(BaseEstimator, ClassifierMixin):
+        """
+        Multi-Epoch Deep Survival & Recurrence Risk Neural Network (PyTorch).
+        Implements multi-epoch gradient optimization with AdamW, Cosine Annealing LR scheduling,
+        Mish non-linear activations, batch normalization, and dropout regularization.
+        """
+        def __init__(
+            self,
+            hidden_dim: int = 128,
+            dropout: float = 0.3,
+            epochs: int = 60,
+            lr: float = 1e-3,
+            weight_decay: float = 1e-4,
+            random_state: int = 42
+        ):
+            self.hidden_dim = hidden_dim
+            self.dropout = dropout
+            self.epochs = epochs
+            self.lr = lr
+            self.weight_decay = weight_decay
+            self.random_state = random_state
+            self.classes_ = np.array([0, 1])
+            self.net_ = None
+
+        def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None):
+            torch.manual_seed(self.random_state)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            in_dim = X.shape[1]
+
+            self.net_ = nn.Sequential(
+                nn.Linear(in_dim, self.hidden_dim),
+                nn.BatchNorm1d(self.hidden_dim),
+                nn.Mish(),
+                nn.Dropout(self.dropout),
+                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+                nn.BatchNorm1d(self.hidden_dim // 2),
+                nn.Mish(),
+                nn.Dropout(self.dropout / 2),
+                nn.Linear(self.hidden_dim // 2, 1)
+            ).to(device)
+
+            optimizer = torch.optim.AdamW(self.net_.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(self.epochs, 1), eta_min=1e-5)
+
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+            y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
+            if sample_weight is not None:
+                w_tensor = torch.tensor(sample_weight, dtype=torch.float32).to(device)
+            else:
+                w_tensor = torch.ones_like(y_tensor)
+
+            self.net_.train()
+            log_interval = max(1, self.epochs // 5)
+            for epoch in range(self.epochs):
+                optimizer.zero_grad()
+                logits = self.net_(X_tensor).squeeze(-1)
+                loss = (F.binary_cross_entropy_with_logits(logits, y_tensor, reduction="none") * w_tensor).mean()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                if (epoch + 1) % log_interval == 0 or epoch == self.epochs - 1:
+                    cur_lr = scheduler.get_last_lr()[0]
+                    log.info("    [PyTorch DeepSurv Epoch %2d/%2d] Loss: %.4f | LR: %.6f", epoch + 1, self.epochs, float(loss.item()), cur_lr)
+
+            return self
+
+        def predict_proba(self, X: np.ndarray) -> np.ndarray:
+            if self.net_ is None:
+                n = len(X)
+                return np.ones((n, 2)) * 0.5
+            self.net_.eval()
+            device = next(self.net_.parameters()).device
+            with torch.no_grad():
+                X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+                logits = self.net_(X_tensor).squeeze(-1)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                return np.column_stack([1.0 - probs, probs])
+
+        def predict(self, X: np.ndarray) -> np.ndarray:
+            return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+else:
+    class PyTorchDeepSurvClassifier:
+        pass
+
+
 # ─── Data Extraction & Metagene Engineering ──────────────────────────────────
 
 def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
@@ -347,10 +446,12 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
 def extract_unified_cohort(
     cohort_name: str,
     horizon_days: int = RISK_HORIZON_DAYS,
-    normalize_batches: bool = True
+    normalize_batches: bool = True,
+    include_external: bool = True
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
     """Loads and unifies single or pan-organ multi-cancer cohorts with optional cross-organ normalization."""
-    cancer_codes = COHORT_GROUPS.get(cohort_name, [cohort_name])
+    is_global_all = cohort_name.upper() in ("PAN-CANCER-ALL", "ALL", "GLOBAL", "ALL-CONSOLIDATED")
+    cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
     all_X = []
     all_y = []
     all_time = []
@@ -358,25 +459,72 @@ def extract_unified_cohort(
 
     for c in cancer_codes:
         log.info("  Loading clinical genomics for: TCGA-%s...", c)
-        X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
+        try:
+            X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
 
-        # Batch normalization across organ cohorts to eliminate tissue-specific baseline offsets
-        if len(cancer_codes) > 1 and normalize_batches and len(X_sub) > 1:
-            stds = X_sub.std(axis=0)
-            stds[stds < 1e-6] = 1.0
-            X_sub = (X_sub - X_sub.mean(axis=0)) / stds
+            # Batch normalization across organ cohorts to eliminate tissue-specific baseline offsets
+            if len(cancer_codes) > 1 and normalize_batches and len(X_sub) > 1:
+                stds = X_sub.std(axis=0)
+                stds[stds < 1e-6] = 1.0
+                X_sub = (X_sub - X_sub.mean(axis=0)) / stds
 
-        all_X.append(X_sub)
-        all_y.append(y_sub)
-        all_time.append(t_sub)
-        all_event.append(e_sub)
+            all_X.append(X_sub)
+            all_y.append(y_sub)
+            all_time.append(t_sub)
+            all_event.append(e_sub)
+        except Exception as exc:
+            log.warning("Could not ingest cohort TCGA-%s: %s", c, exc)
+
+    # Ingest external independent cohorts in single-flow if requested
+    if is_global_all or include_external:
+        ext_dir = ROOT / "data" / "processed" / "external"
+        mb_file = ext_dir / "metabric_harmonized.parquet"
+        if mb_file.exists():
+            try:
+                log.info("  Consolidating independent cohort: METABRIC into single flow...")
+                df_mb = pd.read_parquet(mb_file)
+                meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
+                g_cols = [c for c in df_mb.columns if c not in meta_cols]
+                X_mb = df_mb[g_cols]
+                if normalize_batches and len(X_mb) > 1:
+                    stds = X_mb.std(axis=0)
+                    stds[stds < 1e-6] = 1.0
+                    X_mb = (X_mb - X_mb.mean(axis=0)) / stds
+                all_X.append(X_mb)
+                all_y.append(df_mb["_Y_3YR"])
+                all_time.append(df_mb["_TIME_DAYS"])
+                all_event.append(df_mb["_EVENT"])
+            except Exception as e:
+                log.warning("Could not include METABRIC in consolidated flow: %s", e)
+
+        gse_file = ext_dir / "gse31210_harmonized.parquet"
+        if gse_file.exists():
+            try:
+                log.info("  Consolidating independent cohort: NCBI GEO GSE31210 into single flow...")
+                df_gse = pd.read_parquet(gse_file)
+                meta_cols = ["_Y_3YR", "_TIME_DAYS", "_EVENT"]
+                g_cols = [c for c in df_gse.columns if c not in meta_cols]
+                X_gse = df_gse[g_cols]
+                if normalize_batches and len(X_gse) > 1:
+                    stds = X_gse.std(axis=0)
+                    stds[stds < 1e-6] = 1.0
+                    X_gse = (X_gse - X_gse.mean(axis=0)) / stds
+                all_X.append(X_gse)
+                all_y.append(df_gse["_Y_3YR"])
+                all_time.append(df_gse["_TIME_DAYS"])
+                all_event.append(df_gse["_EVENT"])
+            except Exception as e:
+                log.warning("Could not include GSE31210 in consolidated flow: %s", e)
+
+    if not all_X:
+        raise RuntimeError(f"No clinical genomic data could be loaded for cohort: {cohort_name}")
 
     X_df = pd.concat(all_X, axis=0).fillna(0.0)
     y = np.concatenate([y_s.values for y_s in all_y]).astype(np.int32)
     times = np.concatenate([t_s.values for t_s in all_time]).astype(np.float32)
     events = np.concatenate([e_s.values for e_s in all_event]).astype(np.int32)
 
-    log.info("  Unified %s Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors)",
+    log.info("  Unified %s Single-Flow Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors)",
              cohort_name, len(y), int((y == 1).sum()), int((y == 0).sum()))
     return X_df, y, times, events
 
@@ -433,20 +581,23 @@ def train_strong_risk_model(
     cohort_name: str,
     n_indiv_genes: int = DEFAULT_N_GENES,
     horizon_days: int = RISK_HORIZON_DAYS,
+    epochs: int = 60,
     seed: int = DEFAULT_RANDOM_SEED,
-    normalize_batches: bool = True
+    normalize_batches: bool = True,
+    include_external: bool = True
 ) -> Dict[str, Any]:
     horizon_years = max(1, round(horizon_days / 365.25))
     time_horizon_str = f"{horizon_years}-Year Progression & Recurrence Risk"
 
     log.info("=" * 76)
     log.info(" TRAINING CLINICAL RISK ENGINE (STACKING ENSEMBLE): %s", cohort_name)
-    log.info(" Target: %s (Horizon: %d days)", time_horizon_str, horizon_days)
+    log.info(" Target: %s (Horizon: %d days | Epochs: %d)", time_horizon_str, horizon_days, epochs)
+    log.info(" Single-Flow Multi-Consortium Optimization (Zero Piecewise Batches)")
     log.info("=" * 76)
 
     # 1. Load Raw Patient Expression and Clinical Outcomes
     X_raw_df, y, times, events = extract_unified_cohort(
-        cohort_name, horizon_days=horizon_days, normalize_batches=normalize_batches
+        cohort_name, horizon_days=horizon_days, normalize_batches=normalize_batches, include_external=include_external
     )
 
     # 2. Stratified 80/20 Partition
@@ -503,14 +654,17 @@ def train_strong_risk_model(
     scale_pos = float(neg_count) / max(pos_count, 1)
     scale_pos_weight = float(np.clip(scale_pos, 0.1, 20.0))
 
-    # 7. Construct Multi-Model Stacking Ensemble
-    log.info("  Configuring Stacking Ensemble (ElasticNet + XGBoost [scale_pos=%.2f] + ExtraTrees)...", scale_pos_weight)
+    # 7. Construct Multi-Model Stacking Ensemble with Multi-Epoch Optimization
+    xgb_estimators = max(180, epochs * 4)
+    elastic_iter = max(4000, epochs * 80)
+    log.info("  Configuring Stacking Ensemble (ElasticNet [%d passes] + XGBoost [%d boosting rounds, scale_pos=%.2f] + ExtraTrees)...",
+             elastic_iter, xgb_estimators, scale_pos_weight)
     base_models = [
         ("elasticnet", LogisticRegression(
-            solver="saga", l1_ratio=0.5, C=0.3, max_iter=4000, random_state=seed
+            solver="saga", l1_ratio=0.5, C=0.3, max_iter=elastic_iter, random_state=seed
         )),
         ("xgboost", XGBClassifier(
-            n_estimators=180, max_depth=3, learning_rate=0.03, subsample=0.8,
+            n_estimators=xgb_estimators, max_depth=3, learning_rate=0.03, subsample=0.8,
             colsample_bytree=0.7, reg_lambda=4.0, reg_alpha=0.5,
             scale_pos_weight=scale_pos_weight, random_state=seed, verbosity=0
         )),
@@ -518,6 +672,13 @@ def train_strong_risk_model(
             n_estimators=150, max_depth=4, min_samples_split=4, bootstrap=True, random_state=seed
         )),
     ]
+    if TORCH_AVAILABLE:
+        log.info("  Integrating PyTorch DeepSurv Multi-Epoch Neural Network (%d epochs, AdamW + CosineAnnealing)...", epochs)
+        base_models.append(
+            ("pytorch_deepsurv", PyTorchDeepSurvClassifier(
+                hidden_dim=128, epochs=epochs, lr=1e-3, random_state=seed
+            ))
+        )
     meta_learner = LogisticRegression(C=1.0, random_state=seed)
 
     ensemble = StackingClassifier(
@@ -621,16 +782,19 @@ def train_strong_risk_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Omics Disease Risk Engine (StacK-Risk)")
-    parser.add_argument("cohorts", nargs="*", default=["PAN-RENAL"], help="Cohort names (e.g. PAN-RENAL KICH all)")
+    parser.add_argument("cohorts", nargs="*", default=["PAN-CANCER-ALL"], help="Cohort names (e.g. PAN-CANCER-ALL PAN-RENAL all)")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs for deep neural & iterative estimators")
     parser.add_argument("--horizon", type=int, default=RISK_HORIZON_DAYS, help="Landmark recurrence horizon in days (e.g. 365, 1095, 1825)")
     parser.add_argument("--n-genes", type=int, default=DEFAULT_N_GENES, help="Number of individual genes")
     parser.add_argument("--no-batch-norm", action="store_true", help="Disable batch normalization for pan-organ cohorts")
+    parser.add_argument("--exclude-external", action="store_true", help="Exclude external independent cohorts from consolidated training")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed")
     args = parser.parse_args()
 
     cohorts = args.cohorts
+    # When user requests 'all', run the consolidated single-flow pan-cancer training across all 33 cohorts + external
     if "all" in [c.lower() for c in cohorts]:
-        cohorts = list(COHORT_GROUPS.keys())
+        cohorts = ["PAN-CANCER-ALL"]
 
     for c in cohorts:
         try:
@@ -638,7 +802,9 @@ def main():
                 c.upper(),
                 n_indiv_genes=args.n_genes,
                 horizon_days=args.horizon,
+                epochs=args.epochs,
                 normalize_batches=not args.no_batch_norm,
+                include_external=not args.exclude_external,
                 seed=args.seed,
             )
         except Exception as e:
