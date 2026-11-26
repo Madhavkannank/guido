@@ -206,6 +206,17 @@ def align_and_label(
                 f"Checked candidates: {candidate_cols}. Available columns: {list(phenotypes.columns)[:20]}"
             )
 
+    # Exclude missing events (prohibit converting NaN events to censored 0)
+    valid_event_mask = y_raw.notna()
+    if not valid_event_mask.all():
+        dropped_count = int((~valid_event_mask).sum())
+        logger.warning(
+            "Excluding %d samples with missing outcome labels (prohibiting silent conversion of NaN to censored 0).",
+            dropped_count
+        )
+        X = X.loc[valid_event_mask]
+        y_raw = y_raw.loc[valid_event_mask]
+
     # Standardize oncology event coding (1 = Disease Event / Deceased / Recurred, 0 = Event-Free / Alive)
     if pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == 'object':
         y_lower = y_raw.astype(str).str.strip().str.lower()
@@ -224,8 +235,17 @@ def align_and_label(
             else:
                 raise ValueError(f"Unable to resolve binary event mapping for column '{label_col}'. Values: {unique_vals}")
     else:
-        y = y_raw.fillna(0).astype(int)
-    
+        y_num = pd.to_numeric(y_raw, errors="coerce")
+        valid_num_mask = y_num.notna() & y_num.isin([0, 1])
+        if not valid_num_mask.all():
+            logger.warning(
+                "Excluding %d samples with invalid numeric event values (must be 0 or 1).",
+                int((~valid_num_mask).sum())
+            )
+            X = X.loc[valid_num_mask]
+            y_num = y_num.loc[valid_num_mask]
+        y = y_num.astype(int)
+
     y.name = "label"
     return X, y
 

@@ -256,7 +256,7 @@ def harmonize_gene_symbols(
 
     report = HarmonizationReport(
         input_count=len(gene_list),
-        resolved_count=len(harmonized_names) - len(unmapped),
+        resolved_count=max(0, len(gene_list) - len(unmapped)),
         unmapped_count=len(unmapped),
         multi_mapped_count=len(multi_mapped),
         harmonized_map=harmonized_map,

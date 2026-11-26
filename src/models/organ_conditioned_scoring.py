@@ -230,7 +230,7 @@ class DeployableOrganScorer:
             res = self.score_single(raw_score=s, organ_cohort=c)
             results.append(res)
 
-        res_df = pd.DataFrame(results)
+        res_df = pd.DataFrame(results, index=df.index)
         return res_df
 
     def to_dict(self) -> Dict[str, Any]:

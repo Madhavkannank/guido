@@ -158,7 +158,10 @@ def fetch_metabric(
             df_expr = df_expr.drop_duplicates(subset=["Hugo_Symbol"], keep="first")
             df_expr = df_expr.set_index("Hugo_Symbol")
 
-        common_patients = [p for p in df_clin.index if p in df_expr.columns and not pd.isna(time_days.loc[p])]
+        common_patients = [
+            p for p in df_clin.index
+            if p in df_expr.columns and not pd.isna(time_days.loc[p]) and time_days.loc[p] > 0 and events.loc[p] in (0, 1)
+        ]
         if len(common_patients) < 50:
             raise ValueError(f"Insufficient overlapping patients in METABRIC ({len(common_patients)})")
 
@@ -309,6 +312,7 @@ def fetch_geo_gse31210(
             "relapse": relapse_status,
             "days": relapse_days[:len(relapse_status)],
         }).set_index("sample_id").loc[common].dropna()
+        clin_df = clin_df[(clin_df["days"] > 0) & clin_df["relapse"].isin([0, 1])]
 
         X_df = df_genes[clin_df.index].T.astype(float).fillna(0.0)
         time_series = clin_df["days"].astype(float)

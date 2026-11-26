@@ -146,13 +146,19 @@ def load_real_tcga_evaluation_data(
 
         # Out-of-fold cross-validated risk scoring using patient-level GroupKFold to prevent leakage
         oof_scores = np.full(n_samples, np.nan, dtype=float)
+        if len(unique_pts) < 2:
+            log.warning("Cohort TCGA-%s has fewer than 2 unique patients (%d); skipping CV.", c_code, len(unique_pts))
+            continue
+
         n_splits = min(3, len(unique_pts))
-        if n_splits >= 2:
-            gkf = GroupKFold(n_splits=n_splits)
-            split_iter = list(gkf.split(X_mat, groups=pt_ids))
-        else:
-            kf = KFold(n_splits=min(3, n_samples), shuffle=True, random_state=42)
-            split_iter = list(kf.split(X_mat))
+        gkf = GroupKFold(n_splits=n_splits)
+        split_iter = list(gkf.split(X_mat, groups=pt_ids))
+
+        # Assert zero patient overlap across folds
+        for f_i, (tr_i, val_i) in enumerate(split_iter):
+            overlap = set(pt_ids[tr_i]).intersection(set(pt_ids[val_i]))
+            if len(overlap) > 0:
+                raise ValueError(f"Patient overlap detected in cohort TCGA-{c_code} fold {f_i}: {overlap}")
 
         for train_idx, val_idx in split_iter:
             X_tr, X_val = X_mat[train_idx], X_mat[val_idx]
@@ -160,13 +166,15 @@ def load_real_tcga_evaluation_data(
             if np.sum(e_tr == 1) < 2:
                 continue
 
+            # Select top 30 variance genes on raw training fold data (before standardization)
+            var_idx = np.argsort(np.var(X_tr, axis=0))[-30:]
+
             # Standardize using training fold statistics
             scaler = StandardScaler()
             X_tr_sc = scaler.fit_transform(X_tr)
             X_val_sc = scaler.transform(X_val)
 
-            # Fit regularized Cox model on top 30 variance genes
-            var_idx = np.argsort(np.var(X_tr_sc, axis=0))[-30:]
+            # Fit regularized Cox model on selected top variance genes
             df_tr_cox = pd.DataFrame(X_tr_sc[:, var_idx], columns=[f"G_{i}" for i in range(len(var_idx))])
             df_tr_cox["time"] = t_tr
             df_tr_cox["event"] = e_tr
@@ -192,8 +200,16 @@ def load_real_tcga_evaluation_data(
             pt_id = pt_ids[idx]
             stage_val = None
             age_val = None
+            cdr_key = None
             if s_id in cdr_map.index:
-                row = cdr_map.loc[s_id]
+                cdr_key = s_id
+            elif len(s_id) >= 15 and s_id[:15] in cdr_map.index:
+                cdr_key = s_id[:15]
+            elif pt_id in cdr_map.index:
+                cdr_key = pt_id
+
+            if cdr_key is not None:
+                row = cdr_map.loc[cdr_key]
                 if isinstance(row, pd.DataFrame):
                     row = row.iloc[0]
                 stage_val = row.get("ajcc_pathologic_tumor_stage", None)
@@ -344,9 +360,15 @@ def main() -> int:
         if n_cv_splits >= 2:
             gkf_ref = GroupKFold(n_splits=n_cv_splits)
             ref_splits = list(gkf_ref.split(df, groups=pt_groups))
+            for f_i, (tr_i, val_i) in enumerate(ref_splits):
+                overlap = set(pt_groups[tr_i]).intersection(set(pt_groups[val_i]))
+                if len(overlap) > 0:
+                    raise ValueError(f"Patient overlap detected in reference partition fold {f_i}: {overlap}")
         else:
-            kf_ref = KFold(n_splits=min(4, len(df)), shuffle=True, random_state=42)
-            ref_splits = list(kf_ref.split(df))
+            raise ValueError(
+                f"Patient-partitioned cross-validation for reference quantiles cannot be performed: "
+                f"only {len(unique_pts)} unique patient(s) available."
+            )
 
         for tr_idx, val_idx in ref_splits:
             train_sub = df.iloc[tr_idx]

@@ -104,6 +104,10 @@ class CandidatePanel:
     fitted_feature_count: int = 0
     comparator_feature_count: int = 0
     comparator_type: str = "screened_high_dimensional_comparator"
+    oof_coverage_ratio: float = 1.0
+    oof_missing_count: int = 0
+    panel_evaluation_status: str = "complete"
+    panel_fit_fold_success_rate: float = 1.0
 
 
 @dataclass
@@ -189,6 +193,7 @@ class MinimalGenePanelDistiller:
         n_subsamples: int = 3,
         max_screen_features: int = 60,
         random_state: int = 42,
+        require_complete_oof: bool = False,
     ):
         self.panel_sizes = panel_sizes or [15, 25, 35, 50]
         self.n_folds = n_folds
@@ -197,6 +202,7 @@ class MinimalGenePanelDistiller:
         self.n_subsamples = n_subsamples
         self.max_screen_features = max(max_screen_features, max(self.panel_sizes))
         self.random_state = random_state
+        self.require_complete_oof = require_complete_oof
 
         self.feature_stability_scores_: Dict[str, float] = {}
         self.feature_weights_: Dict[str, float] = {}
@@ -212,7 +218,7 @@ class MinimalGenePanelDistiller:
         data_source: str = "synthetic",
         is_synthetic: bool = True,
         endpoint: str = "PFI",
-        require_complete_oof: bool = False,
+        require_complete_oof: Optional[bool] = None,
     ) -> DistillationReport:
         """
         Runs stability selection across CV folds to rank genes and extract candidate panels.
@@ -251,7 +257,14 @@ class MinimalGenePanelDistiller:
         if patient_ids is not None:
             extracted_patients = extract_tcga_patient_ids(patient_ids)[valid_mask]
         elif sample_ids is not None:
-            extracted_patients = extract_tcga_patient_ids(sample_ids)[valid_mask]
+            extracted = extract_tcga_patient_ids(sample_ids)[valid_mask]
+            if any(str(s).startswith("TCGA-") for s in sample_ids):
+                extracted_patients = extracted
+            else:
+                logger.info(
+                    "Sample IDs provided do not contain TCGA patient barcodes; "
+                    "preserving ungrouped status as patient identifiers are unavailable."
+                )
         elif hasattr(df_X, "index") and len(df_X.index) > 0:
             first_idx = str(df_X.index[0])
             if first_idx.startswith("TCGA-"):
@@ -264,25 +277,34 @@ class MinimalGenePanelDistiller:
         if extracted_patients is not None:
             unique_patients = np.unique(extracted_patients)
             n_patients = len(unique_patients)
-            if n_patients >= self.n_folds:
-                gkf = GroupKFold(n_splits=self.n_folds)
-                splits = list(gkf.split(X, groups=extracted_patients))
-                cv_strategy = f"Patient-Grouped GroupKFold (N={n_patients} patients, {self.n_folds} folds)"
-                patient_grouping_status = "patient_grouped_strictly_partitioned"
-                # Adversarial verification: verify 0 patient overlap across all folds
-                for f_i, (tr_i, val_i) in enumerate(splits):
-                    overlap = set(extracted_patients[tr_i]).intersection(set(extracted_patients[val_i]))
-                    if len(overlap) > 0:
-                        raise ValueError(f"Patient overlap detected in fold {f_i}: {overlap}")
+            if n_patients < 2:
+                raise ValueError(
+                    f"Patient-level cross-validation cannot be performed: only {n_patients} unique patient(s) "
+                    "available. At least 2 unique patients are required to partition data into disjoint training and validation sets."
+                )
+
+            effective_folds = min(self.n_folds, n_patients)
+            gkf = GroupKFold(n_splits=effective_folds)
+            splits = list(gkf.split(X, groups=extracted_patients))
+
+            if effective_folds < self.n_folds:
+                cv_strategy = (
+                    f"Patient-Grouped GroupKFold (N={n_patients} patients, "
+                    f"adjusted to {effective_folds} folds from requested {self.n_folds} due to patient count)"
+                )
             else:
-                kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_state)
-                splits = list(kf.split(X))
-                cv_strategy = f"Row-Level KFold ({self.n_folds} folds, insufficient unique patients: {n_patients} < {self.n_folds})"
-                patient_grouping_status = "row_level_insufficient_unique_patients"
+                cv_strategy = f"Patient-Grouped GroupKFold (N={n_patients} patients, {effective_folds} folds)"
+            patient_grouping_status = "patient_grouped_strictly_partitioned"
+
+            # Adversarial verification: verify 0 patient overlap across all folds
+            for f_i, (tr_i, val_i) in enumerate(splits):
+                overlap = set(extracted_patients[tr_i]).intersection(set(extracted_patients[val_i]))
+                if len(overlap) > 0:
+                    raise ValueError(f"Patient overlap detected in fold {f_i}: {overlap}")
         else:
             kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_state)
             splits = list(kf.split(X))
-            cv_strategy = f"Row-Level KFold ({self.n_folds} folds, unverified patient grouping)"
+            cv_strategy = f"Row-Level KFold ({self.n_folds} folds, unverified patient grouping - patient IDs unavailable)"
             patient_grouping_status = "row_level_ungrouped_patient_ids_unavailable"
             n_patients = n_samples
 
@@ -312,6 +334,8 @@ class MinimalGenePanelDistiller:
         summed_coefs = np.zeros(n_features, dtype=float)
         fold_diagnostics: List[Dict[str, Any]] = []
 
+        effective_require_complete_oof = self.require_complete_oof if require_complete_oof is None else require_complete_oof
+
         # ─── Step 2: Out-of-Fold Nested Cross-Validation Loop ────────────────
         for fold_idx, (train_idx, val_idx) in enumerate(splits):
             X_tr, X_val = X[train_idx], X[val_idx]
@@ -325,7 +349,11 @@ class MinimalGenePanelDistiller:
                 "n_train_events": int(np.sum(e_tr == 1)),
                 "n_val_events": int(np.sum(e_val == 1)),
                 "fit_success": False,
+                "comparator_fit_success": False,
+                "panel_fit_success": {size: False for size in oof_panel_scores.keys()},
                 "failure_reason": None,
+                "failure_reasons": [],
+                "panel_failure_reasons": {size: None for size in oof_panel_scores.keys()},
                 "fitted_comparator_features": 0,
                 "patient_overlap_count": 0,
                 "patient_overlap_detected": False,
@@ -343,7 +371,9 @@ class MinimalGenePanelDistiller:
                 fold_diag["n_val_patients"] = len(val_pts)
 
             if np.sum(e_tr == 1) < 3:
-                fold_diag["failure_reason"] = "Insufficient training events (<3)"
+                reason = "Insufficient training events (<3)"
+                fold_diag["failure_reason"] = reason
+                fold_diag["failure_reasons"].append(reason)
                 fold_diagnostics.append(fold_diag)
                 logger.warning("Fold %d has < 3 events in training set; skipping.", fold_idx)
                 continue
@@ -411,16 +441,22 @@ class MinimalGenePanelDistiller:
                 cph_full.fit(df_tr_full, duration_col="time", event_col="event")
                 full_b = cph_full.params_.values
                 oof_comparator_scores[val_idx] = np.dot(X_val_sc[:, screened_indices], full_b)
-                fold_diag["fit_success"] = True
+                fold_diag["comparator_fit_success"] = True
                 fold_diag["fitted_comparator_features"] = n_screened
             except Exception as e:
-                fold_diag["failure_reason"] = f"Comparator fit failed: {str(e)}"
+                err_msg = f"Comparator fit failed: {str(e)}"
+                fold_diag["comparator_fit_success"] = False
+                fold_diag["failure_reasons"].append(err_msg)
                 logger.warning("Comparator fold %d fit exception: %s", fold_idx, e)
 
             # 2. Candidate Panel out-of-fold predictions
             for size in oof_panel_scores.keys():
                 top_k = local_ranked[:size]
                 if len(top_k) < size:
+                    fold_diag["panel_fit_success"][size] = False
+                    err_msg = f"Insufficient ranked features for panel size {size}: {len(top_k)} < {size}"
+                    fold_diag["panel_failure_reasons"][size] = err_msg
+                    fold_diag["failure_reasons"].append(err_msg)
                     continue
                 try:
                     df_tr_panel = pd.DataFrame(
@@ -429,12 +465,22 @@ class MinimalGenePanelDistiller:
                     )
                     df_tr_panel["time"] = t_tr
                     df_tr_panel["event"] = e_tr
-                    cph_panel = CoxPHFitter(penalizer=0.02, l1_ratio=0.1)
+                    cph_panel = CoxPHFitter(penalizer=self.penalizer, l1_ratio=self.l1_ratio)
                     cph_panel.fit(df_tr_panel, duration_col="time", event_col="event")
                     panel_b = cph_panel.params_.values
                     oof_panel_scores[size][val_idx] = np.dot(X_val_sc[:, top_k], panel_b)
+                    fold_diag["panel_fit_success"][size] = True
                 except Exception as e:
+                    err_msg = f"Panel size {size} fit failed: {str(e)}"
+                    fold_diag["panel_fit_success"][size] = False
+                    fold_diag["panel_failure_reasons"][size] = str(e)
+                    fold_diag["failure_reasons"].append(err_msg)
                     logger.warning("Panel size %d fold %d fit exception: %s", size, fold_idx, e)
+
+            all_panels_ok = all(fold_diag["panel_fit_success"].values()) if len(fold_diag["panel_fit_success"]) > 0 else True
+            fold_diag["fit_success"] = bool(fold_diag["comparator_fit_success"] and all_panels_ok)
+            if not fold_diag["fit_success"]:
+                fold_diag["failure_reason"] = "; ".join(fold_diag["failure_reasons"]) if fold_diag["failure_reasons"] else "Fold fit failed"
 
             fold_diagnostics.append(fold_diag)
 
@@ -443,17 +489,22 @@ class MinimalGenePanelDistiller:
         missing_comparator_count = int(np.sum(~valid_comp_mask))
         oof_coverage_ratio = round(float(np.sum(valid_comp_mask)) / max(n_samples, 1), 4)
 
+        any_panel_missing = any(np.isnan(oof_panel_scores[s]).any() for s in oof_panel_scores)
         failed_folds = [f for f in fold_diagnostics if not f["fit_success"]]
-        if missing_comparator_count > 0:
+        has_missing = (missing_comparator_count > 0) or any_panel_missing or (len(failed_folds) > 0)
+
+        if has_missing:
             evaluation_status = "incomplete_missing_predictions"
             logger.warning(
-                "Incomplete OOF predictions: %d/%d samples lack valid comparator predictions. Failed folds: %d",
-                missing_comparator_count, n_samples, len(failed_folds)
+                "Incomplete OOF predictions: %d/%d samples lack valid comparator predictions. "
+                "Any panel missing: %s. Failed folds: %d/%d",
+                missing_comparator_count, n_samples, any_panel_missing, len(failed_folds), len(splits)
             )
-            if require_complete_oof:
+            if effective_require_complete_oof:
                 raise RuntimeError(
-                    f"Cross-validation incomplete: {missing_comparator_count}/{n_samples} samples lack valid OOF predictions. "
-                    f"Failed folds: {len(failed_folds)}. Reasons: {[f['failure_reason'] for f in failed_folds]}"
+                    f"Cross-validation incomplete: {missing_comparator_count}/{n_samples} samples lack valid comparator predictions, "
+                    f"panel missing: {any_panel_missing}. Failed folds: {len(failed_folds)}. "
+                    f"Reasons: {[f['failure_reason'] for f in failed_folds]}"
                 )
         else:
             evaluation_status = "complete"
@@ -499,6 +550,13 @@ class MinimalGenePanelDistiller:
             else:
                 retention = 0.0
 
+            n_folds_total = max(1, len(splits))
+            fold_panel_successes = sum(
+                1 for f in fold_diagnostics
+                if f.get("panel_fit_success", {}).get(size, False)
+            )
+            panel_fold_rate = round(float(fold_panel_successes) / float(n_folds_total), 4)
+
             retention_curve.append({
                 "panel_size": size,
                 "c_index": sub_c,
@@ -507,10 +565,13 @@ class MinimalGenePanelDistiller:
                 "retention_ratio": retention,
                 "oof_valid_samples": n_valid_p,
                 "oof_missing_samples": n_samples - n_valid_p,
+                "oof_coverage_ratio": round(float(n_valid_p) / max(n_samples, 1), 4),
+                "evaluation_status": "complete" if n_valid_p == n_samples else "incomplete_missing_predictions",
+                "panel_fit_fold_success_rate": panel_fold_rate,
             })
 
         # ─── Step 5: Global Consensus Stability Ranking on Full Data ─────────
-        total_folds = max(1.0, float(self.n_folds))
+        total_folds = max(1.0, float(len(splits)))
         stability_prob = selection_counts / total_folds
         mean_coefs = summed_coefs / total_folds
 
@@ -556,7 +617,7 @@ class MinimalGenePanelDistiller:
                 )
                 df_consensus["time"] = times
                 df_consensus["event"] = events
-                cph_cons = CoxPHFitter(penalizer=0.02, l1_ratio=0.1)
+                cph_cons = CoxPHFitter(penalizer=self.penalizer, l1_ratio=self.l1_ratio)
                 cph_cons.fit(df_consensus, duration_col="time", event_col="event")
                 sub_weights = {
                     sub_genes[i]: round(float(cph_cons.params_.values[i]), 4)
@@ -600,6 +661,10 @@ class MinimalGenePanelDistiller:
                 fitted_feature_count=len(sub_genes),
                 comparator_feature_count=comparator_feature_count,
                 comparator_type=comparator_type,
+                oof_coverage_ratio=curve_entry["oof_coverage_ratio"] if curve_entry else 0.0,
+                oof_missing_count=curve_entry["oof_missing_samples"] if curve_entry else n_samples,
+                panel_evaluation_status=curve_entry["evaluation_status"] if curve_entry else "incomplete_missing_predictions",
+                panel_fit_fold_success_rate=curve_entry["panel_fit_fold_success_rate"] if curve_entry else 0.0,
             )
 
         limitations = [
@@ -645,6 +710,8 @@ class MinimalGenePanelDistiller:
             fold_diagnostics=fold_diagnostics,
             evaluation_status=evaluation_status,
         )
+        self.oof_comparator_scores_ = oof_comparator_scores
+        self.oof_panel_scores_ = oof_panel_scores
         self.distillation_report_ = report
         return report
 
@@ -723,6 +790,10 @@ class MinimalGenePanelDistiller:
             "patient_grouping_status": report.patient_grouping_status,
             "oof_prediction_coverage": report.oof_coverage_ratio,
             "evaluation_status": report.evaluation_status,
+            "panel_oof_coverage_ratio": panel.oof_coverage_ratio,
+            "panel_oof_missing_count": panel.oof_missing_count,
+            "panel_evaluation_status": panel.panel_evaluation_status,
+            "panel_fit_fold_success_rate": panel.panel_fit_fold_success_rate,
             "housekeeping_candidate_controls": {
                 "qualified_stable_controls": QUALIFIED_HOUSEKEEPING_CONTROLS,
                 "tissue_variable_controls_to_avoid": TISSUE_VARIABLE_HOUSEKEEPING_CONTROLS,

@@ -23,6 +23,7 @@ import re
 import numpy as np
 import pandas as pd
 import pytest
+from lifelines import CoxPHFitter, KaplanMeierFitter
 
 from src.models.panel_distillation import (
     MinimalGenePanelDistiller,
@@ -404,20 +405,549 @@ def test_adversarial_patient_level_cross_validation_zero_overlap():
         assert fold["patient_overlap_detected"] is False
 
 
-def test_adversarial_strict_oof_prediction_buffer_integrity():
+def test_adversarial_oof_failure_injection_comparator_failure(monkeypatch):
     """
-    Adversarial Check J: Strict NaN OOF Prediction Buffer Integrity.
-    Verifies that unpredicted samples remain NaN and that incomplete prediction coverage
-    is surfaced transparently in report metrics.
+    Adversarial Check J1: Live OOF Failure Injection on Comparator Model.
+    Replaces self-contained NumPy simulation with real MinimalGenePanelDistiller.fit() execution.
+    Injects deterministic failure into comparator model fitting for fold 1.
+    Verifies:
+      1. Failed predictions remain NaN in oof_comparator_scores buffer (never converted to 0.0).
+      2. Missing predictions are NOT treated as low-risk or zero-risk.
+      3. OOF coverage ratio is calculated strictly as valid_samples / total_samples (< 1.0).
+      4. evaluation_status is set to 'incomplete_missing_predictions'.
+      5. Fold diagnostics record fit_success=False, comparator_fit_success=False, and failure_reasons.
+      6. distiller.fit(require_complete_oof=True) raises an explicit RuntimeError.
     """
-    oof_buffer = np.full(50, np.nan, dtype=float)
-    # Simulate fold 0 and fold 1 succeeding, but fold 2 failing
-    oof_buffer[:35] = np.random.uniform(0.1, 0.9, size=35)
-    # Remaining 15 samples are NaN
+    np.random.seed(42)
+    n_samples = 40
+    df_X = pd.DataFrame(
+        np.random.normal(0, 1, size=(n_samples, 20)),
+        columns=[f"G_{i}" for i in range(20)],
+    )
+    times = np.random.uniform(50, 1000, size=n_samples)
+    events = np.random.binomial(1, 0.5, size=n_samples)
 
-    coverage = float(np.sum(~np.isnan(oof_buffer)) / len(oof_buffer))
-    assert coverage == 35 / 50  # 0.70
-    assert np.isnan(oof_buffer[40])  # Must not silently become 0.0!
+    orig_fit = CoxPHFitter.fit
+
+    def mock_fit_comparator_fail(self, df, *args, **kwargs):
+        # Full comparator model uses penalizer 0.05
+        if getattr(self, "penalizer", None) == 0.05:
+            call_idx = getattr(mock_fit_comparator_fail, "call_count", 0)
+            mock_fit_comparator_fail.call_count = call_idx + 1
+            if call_idx == 1:
+                raise RuntimeError("Simulated solver divergence in fold 1 comparator")
+        return orig_fit(self, df, *args, **kwargs)
+
+    mock_fit_comparator_fail.call_count = 0
+    monkeypatch.setattr(CoxPHFitter, "fit", mock_fit_comparator_fail)
+
+    distiller = MinimalGenePanelDistiller(
+        panel_sizes=[5, 10],
+        n_folds=3,
+        n_subsamples=1,
+        random_state=42,
+    )
+
+    # 1. require_complete_oof=False: should complete with status="incomplete_missing_predictions"
+    report = distiller.fit(
+        df_X=df_X,
+        times=times,
+        events=events,
+        data_source="adversarial_oof_failure_injection",
+        is_synthetic=True,
+        require_complete_oof=False,
+    )
+
+    assert report.evaluation_status == "incomplete_missing_predictions"
+    assert report.oof_coverage_ratio < 1.0
+    assert report.oof_coverage_ratio == round(float(np.sum(~np.isnan(distiller.oof_comparator_scores_))) / n_samples, 4)
+
+    # Failed predictions must remain strictly NaN (never converted to 0.0)
+    failed_val_indices = np.where(np.isnan(distiller.oof_comparator_scores_))[0]
+    assert len(failed_val_indices) > 0
+    for idx in failed_val_indices:
+        assert np.isnan(distiller.oof_comparator_scores_[idx])
+        assert distiller.oof_comparator_scores_[idx] != 0.0
+
+    # Fold 1 diagnostics verification
+    f1 = report.fold_diagnostics[1]
+    assert f1["comparator_fit_success"] is False
+    assert f1["fit_success"] is False
+    assert any("Simulated solver divergence in fold 1 comparator" in r for r in f1["failure_reasons"])
+
+    # 2. require_complete_oof=True: must raise RuntimeError
+    mock_fit_comparator_fail.call_count = 0
+    with pytest.raises(RuntimeError, match="Cross-validation incomplete"):
+        distiller.fit(
+            df_X=df_X,
+            times=times,
+            events=events,
+            data_source="adversarial_oof_failure_injection",
+            is_synthetic=True,
+            require_complete_oof=True,
+        )
+
+
+def test_adversarial_oof_failure_injection_candidate_panel_failure(monkeypatch):
+    """
+    Adversarial Check J2: Separated Candidate Panel vs Comparator Diagnostics.
+    Injects deterministic failure into candidate panel size 10 in fold 0, while the comparator succeeds.
+    Verifies:
+      1. Comparator fit succeeds on fold 0 (comparator_fit_success=True).
+      2. Candidate panel size 10 fails on fold 0 (panel_fit_success[10]=False).
+      3. CRITICAL: Fold overall fit_success is False! (A fold must NOT be marked completely
+         successful merely because the comparator succeeded when candidate panels failed).
+      4. Candidate panel 10 records incomplete evaluation status, missing count > 0,
+         coverage ratio < 1.0, and fold success rate < 1.0.
+      5. Other candidate panels (size 5) succeed and maintain complete status.
+      6. require_complete_oof=True raises RuntimeError.
+    """
+    np.random.seed(42)
+    n_samples = 40
+    df_X = pd.DataFrame(
+        np.random.normal(0, 1, size=(n_samples, 20)),
+        columns=[f"G_{i}" for i in range(20)],
+    )
+    times = np.random.uniform(50, 1000, size=n_samples)
+    events = np.random.binomial(1, 0.5, size=n_samples)
+
+    orig_fit = CoxPHFitter.fit
+
+    def mock_fit_panel_fail(self, df, *args, **kwargs):
+        # Candidate panel has columns starting with P_
+        p_cols = [c for c in df.columns if c.startswith("P_")]
+        if len(p_cols) == 10:
+            call_idx = getattr(mock_fit_panel_fail, "p10_count", 0)
+            mock_fit_panel_fail.p10_count = call_idx + 1
+            if call_idx == 0:
+                raise RuntimeError("Simulated singularity in panel size 10 Cox model")
+        return orig_fit(self, df, *args, **kwargs)
+
+    mock_fit_panel_fail.p10_count = 0
+    monkeypatch.setattr(CoxPHFitter, "fit", mock_fit_panel_fail)
+
+    distiller = MinimalGenePanelDistiller(
+        panel_sizes=[5, 10],
+        n_folds=3,
+        n_subsamples=1,
+        random_state=42,
+    )
+
+    report = distiller.fit(
+        df_X=df_X,
+        times=times,
+        events=events,
+        data_source="adversarial_panel_failure_test",
+        is_synthetic=True,
+        require_complete_oof=False,
+    )
+
+    f0 = report.fold_diagnostics[0]
+    assert f0["comparator_fit_success"] is True
+    assert f0["panel_fit_success"][10] is False
+    assert f0["panel_fit_success"][5] is True
+    assert f0["fit_success"] is False, "Fold must NOT be marked successful when a candidate panel failed!"
+    assert any("Simulated singularity in panel size 10" in r for r in f0["failure_reasons"])
+
+    p10 = report.candidate_panels[10]
+    assert p10.panel_evaluation_status == "incomplete_missing_predictions"
+    assert p10.oof_missing_count > 0
+    assert p10.oof_coverage_ratio < 1.0
+    assert p10.panel_fit_fold_success_rate < 1.0
+
+    p5 = report.candidate_panels[5]
+    assert p5.panel_evaluation_status == "complete"
+    assert p5.oof_missing_count == 0
+    assert p5.oof_coverage_ratio == 1.0
+    assert p5.panel_fit_fold_success_rate == 1.0
+
+    # With require_complete_oof=True, must raise
+    mock_fit_panel_fail.p10_count = 0
+    with pytest.raises(RuntimeError, match="Cross-validation incomplete"):
+        distiller.fit(
+            df_X=df_X,
+            times=times,
+            events=events,
+            data_source="adversarial_panel_failure_test",
+            is_synthetic=True,
+            require_complete_oof=True,
+        )
+
+
+def test_adversarial_patient_cv_unique_patients_fewer_than_folds():
+    """
+    Adversarial Check I2: Patient-Level CV with Unique Patients Fewer than Requested Folds.
+    When 3 unique patients are present but 5 folds are requested:
+      1. Effective folds dynamically adjusts to min(5, 3) = 3 folds.
+      2. Never silently falls back to row-level KFold.
+      3. Partitions strictly by patient barcode with 0 patient overlap in every fold.
+      4. cv_strategy explicitly documents the adjustment.
+      5. patient_grouping_status remains 'patient_grouped_strictly_partitioned'.
+    """
+    patients = ["TCGA-AA-0001", "TCGA-BB-0002", "TCGA-CC-0003"]
+    sample_ids = []
+    for pt in patients:
+        for vial_idx in range(8):
+            sample_ids.append(f"{pt}-{vial_idx:02d}A")
+
+    n_samples = len(sample_ids)
+    df_X = pd.DataFrame(
+        np.random.normal(0, 1, size=(n_samples, 15)),
+        index=sample_ids,
+        columns=[f"G_{i}" for i in range(15)],
+    )
+    times = np.random.uniform(100, 1000, size=n_samples)
+    events = np.array([1, 0] * (n_samples // 2))
+
+    distiller = MinimalGenePanelDistiller(
+        panel_sizes=[5],
+        n_folds=5,  # Requested 5 folds, but only 3 unique patients exist
+        n_subsamples=1,
+        random_state=42,
+    )
+
+    report = distiller.fit(
+        df_X=df_X,
+        times=times,
+        events=events,
+        sample_ids=sample_ids,
+        data_source="few_patients_test",
+        is_synthetic=True,
+    )
+
+    assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
+    assert report.patient_count == 3
+    assert len(report.fold_diagnostics) == 3
+    assert "adjusted to 3 folds from requested 5" in report.cv_strategy
+
+    for fold in report.fold_diagnostics:
+        assert fold["patient_overlap_count"] == 0
+        assert fold["patient_overlap_detected"] is False
+
+
+def test_adversarial_patient_cv_fewer_than_two_patients_raises_value_error():
+    """
+    Adversarial Check I3: Patient-Level CV with Fewer than 2 Unique Patients.
+    When only 1 unique patient is present, data cannot be partitioned into disjoint
+    training and validation patient sets.
+    Verifies that distiller.fit() raises an explicit ValueError.
+    """
+    sample_ids = [f"TCGA-ZZ-9999-{i:02d}A" for i in range(24)]
+    n_samples = len(sample_ids)
+    df_X = pd.DataFrame(
+        np.random.normal(0, 1, size=(n_samples, 10)),
+        index=sample_ids,
+        columns=[f"G_{i}" for i in range(10)],
+    )
+    times = np.random.uniform(100, 1000, size=n_samples)
+    events = np.array([1, 0] * (n_samples // 2))
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[5], n_folds=3, random_state=42)
+
+    with pytest.raises(ValueError, match="Patient-level cross-validation cannot be performed"):
+        distiller.fit(
+            df_X=df_X,
+            times=times,
+            events=events,
+            sample_ids=sample_ids,
+            data_source="single_patient_test",
+            is_synthetic=True,
+        )
+
+
+def test_adversarial_patient_cv_ungrouped_fallback_only_when_no_barcodes():
+    """
+    Adversarial Check I4: Ungrouped Row-Level CV Only When Patient IDs Genuinely Unavailable.
+    When sample IDs do not contain TCGA 12-char patient barcodes:
+      1. Falls back to row-level KFold.
+      2. Preserves status 'row_level_ungrouped_patient_ids_unavailable'.
+    """
+    sample_ids = [f"CELL_LINE_SAMPLE_{i:03d}" for i in range(30)]
+    df_X = pd.DataFrame(
+        np.random.normal(0, 1, size=(30, 15)),
+        index=sample_ids,
+        columns=[f"G_{i}" for i in range(15)],
+    )
+    times = np.random.uniform(50, 500, size=30)
+    events = np.random.binomial(1, 0.5, size=30)
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[5], n_folds=3, n_subsamples=1, random_state=42)
+    report = distiller.fit(
+        df_X=df_X,
+        times=times,
+        events=events,
+        sample_ids=sample_ids,
+        data_source="cell_lines",
+        is_synthetic=True,
+    )
+
+    assert report.patient_grouping_status == "row_level_ungrouped_patient_ids_unavailable"
+    assert "Row-Level KFold" in report.cv_strategy
+
+
+def test_adversarial_pancan_master_loader_deduplication_and_sample_prioritization(tmp_path, monkeypatch):
+    """
+    Adversarial Check N1: PanCan Master Loader Patient Deduplication & Sample Prioritization.
+    Verifies that load_pancan_master_data():
+      1. Deduplicates multiple biospecimens for the same 12-char patient.
+      2. Prioritizes primary solid tumor (-01) over recurrent (-02) or metastatic (-06).
+    """
+    import retrain_fixed
+
+    samples = ["TCGA-01-0001-01A", "TCGA-01-0001-02A", "TCGA-02-0002-01A"]
+    genes = [f"GENE_{i}" for i in range(60)]
+
+    all_samples = list(samples)
+    for i in range(3, 55):
+        all_samples.append(f"TCGA-03-{i:04d}-01A")
+
+    expr_data = np.random.normal(0, 1, size=(len(genes), len(all_samples)))
+    df_expr = pd.DataFrame(expr_data, index=genes, columns=all_samples)
+
+    cdr_rows = []
+    for s in all_samples:
+        cdr_rows.append({
+            "sample": s,
+            "Redaction": None,
+            "PFI": 1 if "-01" in s else 0,
+            "PFI.time": 300.0,
+            "OS": 1,
+            "OS.time": 400.0,
+        })
+    df_cdr = pd.DataFrame(cdr_rows).set_index("sample")
+
+    shards_dir = tmp_path / "data" / "processed" / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    df_expr.to_parquet(shards_dir / "TCGA_PANCAN_EB_ADJUST_expression.parquet")
+
+    xena_dir = tmp_path / "data" / "raw" / "xena"
+    xena_dir.mkdir(parents=True, exist_ok=True)
+    df_cdr.to_csv(xena_dir / "TCGA_CDR_survival.tsv", sep="\t")
+
+    monkeypatch.setattr(retrain_fixed, "ROOT", tmp_path)
+    monkeypatch.setattr(retrain_fixed, "XENA_DIR", xena_dir)
+
+    res = retrain_fixed.load_pancan_master_data(horizon_days=1095, endpoint="PFI")
+    assert res is not None
+    X, y, times, events = res
+
+    # TCGA-01-0001-01A must be kept, TCGA-01-0001-02A must be excluded
+    assert "TCGA-01-0001-01A" in X.index
+    assert "TCGA-01-0001-02A" not in X.index
+    pts = [s[:12] for s in X.index]
+    assert pts.count("TCGA-01-0001") == 1
+
+
+def test_adversarial_pancan_master_loader_excludes_missing_events_and_nonpositive_times(tmp_path, monkeypatch):
+    """
+    Adversarial Check N2: Exclusion of Missing Events and Non-Positive Times.
+    Verifies that load_pancan_master_data() strictly excludes:
+      - NaN events (prohibiting default conversion of NaN events to censored 0)
+      - Non-numeric / invalid events (e.g. 2)
+      - Non-positive follow-up times (t <= 0)
+      - Missing follow-up times (NaN)
+    """
+    import retrain_fixed
+
+    samples = [f"TCGA-10-{i:04d}-01A" for i in range(80)]
+    genes = [f"GENE_{i}" for i in range(20)]
+    df_expr = pd.DataFrame(np.random.normal(0, 1, size=(len(genes), len(samples))), index=genes, columns=samples)
+
+    cdr_rows = []
+    for i, s in enumerate(samples):
+        if i == 0:
+            e, t = np.nan, 300.0
+        elif i == 1:
+            e, t = 2, 300.0
+        elif i == 2:
+            e, t = 1, 0.0
+        elif i == 3:
+            e, t = 1, -5.0
+        elif i == 4:
+            e, t = 1, np.nan
+        else:
+            e = 1 if i % 2 == 0 else 0
+            t = 300.0 if e == 1 else 1500.0
+        cdr_rows.append({"sample": s, "Redaction": None, "PFI": e, "PFI.time": t})
+
+    df_cdr = pd.DataFrame(cdr_rows).set_index("sample")
+
+    shards_dir = tmp_path / "data" / "processed" / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    df_expr.to_parquet(shards_dir / "TCGA_PANCAN_EB_ADJUST_expression.parquet")
+
+    xena_dir = tmp_path / "data" / "raw" / "xena"
+    xena_dir.mkdir(parents=True, exist_ok=True)
+    df_cdr.to_csv(xena_dir / "TCGA_CDR_survival.tsv", sep="\t")
+
+    monkeypatch.setattr(retrain_fixed, "ROOT", tmp_path)
+    monkeypatch.setattr(retrain_fixed, "XENA_DIR", xena_dir)
+
+    res = retrain_fixed.load_pancan_master_data(horizon_days=1095, endpoint="PFI")
+    assert res is not None
+    X, y, times, events = res
+
+    # Samples 0-4 must be strictly excluded!
+    for bad_idx in range(5):
+        bad_sample = samples[bad_idx]
+        assert bad_sample not in X.index, f"Invalid sample {bad_sample} was not excluded!"
+
+    assert set(events.unique()).issubset({0, 1})
+    assert (times > 0).all()
+    assert not events.isna().any()
+    assert not times.isna().any()
+
+
+def test_adversarial_pancan_master_loader_alignment_and_provenance_fallback(monkeypatch):
+    """
+    Adversarial Check N3: Fallback Provenance Recording and Matrix Axis Alignment.
+    Verifies that when master matrix is absent or fails, extract_unified_cohort(return_provenance=True):
+      1. Explicitly records data_provenance == 'individual_cohort_aggregation_fallback'.
+      2. Records master_matrix_fallback == True with a non-empty master_fallback_reason.
+    """
+    import retrain_fixed
+
+    # 1. Test invalid endpoint raises ValueError in load_pancan_master_data
+    with pytest.raises(ValueError, match="Invalid survival endpoint"):
+        retrain_fixed.load_pancan_master_data(endpoint="BOGUS_ENDPOINT")
+
+    # 2. Test fallback provenance in extract_unified_cohort when master matrix returns None
+    def mock_load_master(*args, **kwargs):
+        return None
+
+    def mock_load_cohort(cohort, *args, **kwargs):
+        if cohort == "BRCA":
+            idx = [f"TCGA-BRCA-{i:04d}-01A" for i in range(10)]
+            df_x = pd.DataFrame(np.random.normal(0, 1, (10, 5)), index=idx, columns=[f"G_{j}" for j in range(5)])
+            y = pd.Series([1, 0] * 5, index=idx)
+            t = pd.Series([200.0] * 10, index=idx)
+            e = pd.Series([1, 0] * 5, index=idx)
+            return df_x, y, t, e
+        raise FileNotFoundError(f"Cohort {cohort} not available")
+
+    monkeypatch.setattr(retrain_fixed, "load_pancan_master_data", mock_load_master)
+    monkeypatch.setattr(retrain_fixed, "load_cohort_data", mock_load_cohort)
+
+    X_df, y, times, events, prov = retrain_fixed.extract_unified_cohort(
+        "PAN-CANCER-ALL", endpoint="PFI", return_provenance=True
+    )
+    assert prov["data_provenance"] == "individual_cohort_aggregation_fallback"
+    assert prov["master_matrix_fallback"] is True
+    assert prov["master_fallback_reason"] is not None
+    assert len(X_df) == 10
+    assert len(y) == 10
+    assert len(times) == 10
+    assert len(events) == 10
+
+
+def test_adversarial_unos_c_index_independent_numerical_validation():
+    """
+    Adversarial Check K2: Uno's IPCW C-Index Independent Numerical Benchmarking.
+    Compares compute_unos_c_index() against an independent KaplanMeierFitter-based
+    reference estimator across 8 deterministic benchmark cases:
+      1. No censoring (events=1 for all samples; matches Harrell's C-index).
+      2. Heavy censoring (>70% censoring).
+      3. Tied event times.
+      4. Tied event and censoring times.
+      5. Equal risk scores (must return exactly 0.5000).
+      6. Censoring survival crossing 0.05 (tau truncation threshold).
+      7. Explicit tau provided.
+      8. Unevaluable cases (all-censored, empty inputs -> None).
+    """
+    def ref_uno(times, events, scores, tau=None):
+        times = np.asarray(times, dtype=float)
+        events = np.asarray(events, dtype=int)
+        scores = np.asarray(scores, dtype=float)
+
+        valid_mask = (times > 0) & (~np.isnan(times)) & (~np.isnan(events)) & (~np.isnan(scores))
+        times = times[valid_mask]
+        events = events[valid_mask]
+        scores = scores[valid_mask]
+
+        n = len(times)
+        event_indices = np.where(events == 1)[0]
+        if len(event_indices) == 0 or n < 2:
+            return None
+
+        kmf = KaplanMeierFitter()
+        kmf.fit(durations=times, event_observed=(1 - events))
+        sf = kmf.survival_function_
+        timeline = sf.index.values
+        s_vals = sf.iloc[:, 0].values
+
+        def get_g_left(t_val):
+            idx = np.searchsorted(timeline, t_val, side="left")
+            if idx == 0:
+                return 1.0
+            return float(s_vals[idx - 1])
+
+        eligible_tau_times = [t for t in np.unique(times) if get_g_left(t) >= 0.05]
+        if not eligible_tau_times:
+            return None
+        max_tau = max(eligible_tau_times)
+        tau_cutoff = max_tau if tau is None else min(float(tau), max_tau)
+
+        num, denom = 0.0, 0.0
+        for i in event_indices:
+            t_i = times[i]
+            if t_i > tau_cutoff:
+                continue
+            g_i = get_g_left(t_i)
+            if g_i < 0.05:
+                continue
+            w_i = 1.0 / (g_i ** 2)
+            longer = np.where(times > t_i)[0]
+            if len(longer) == 0:
+                continue
+            num += (np.sum(scores[i] > scores[longer]) + 0.5 * np.sum(scores[i] == scores[longer])) * w_i
+            denom += len(longer) * w_i
+        return round(float(num / denom), 4) if denom > 0 else None
+
+    # Case 1: No censoring
+    t_no_cens = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+    e_no_cens = np.array([1, 1, 1, 1, 1])
+    s_no_cens = np.array([0.9, 0.8, 0.5, 0.3, 0.1])
+    u_guid = compute_unos_c_index(times=t_no_cens, events=e_no_cens, scores=s_no_cens)
+    u_ref = ref_uno(t_no_cens, e_no_cens, s_no_cens)
+    assert u_guid == u_ref == 1.0
+
+    # Case 2: Heavy censoring
+    np.random.seed(101)
+    t_heavy = np.sort(np.random.uniform(5, 500, size=60))
+    e_heavy = np.random.binomial(1, 0.25, size=60)
+    e_heavy[0] = 1
+    s_heavy = np.random.uniform(0, 1, size=60)
+    assert compute_unos_c_index(times=t_heavy, events=e_heavy, scores=s_heavy) == ref_uno(t_heavy, e_heavy, s_heavy)
+
+    # Case 3: Tied event times
+    t_tied_e = np.array([10.0, 10.0, 20.0, 30.0, 30.0, 40.0])
+    e_tied_e = np.array([1, 1, 0, 1, 1, 0])
+    s_tied_e = np.array([0.8, 0.7, 0.4, 0.6, 0.3, 0.1])
+    assert compute_unos_c_index(times=t_tied_e, events=e_tied_e, scores=s_tied_e) == ref_uno(t_tied_e, e_tied_e, s_tied_e)
+
+    # Case 4: Tied event & censoring times
+    t_tied_ec = np.array([10.0, 10.0, 20.0, 20.0, 30.0, 40.0])
+    e_tied_ec = np.array([1, 0, 1, 0, 1, 0])
+    s_tied_ec = np.array([0.9, 0.8, 0.7, 0.6, 0.5, 0.4])
+    assert compute_unos_c_index(times=t_tied_ec, events=e_tied_ec, scores=s_tied_ec) == ref_uno(t_tied_ec, e_tied_ec, s_tied_ec)
+
+    # Case 5: Equal risk scores (must be 0.5000)
+    s_equal = np.full(len(t_tied_ec), 0.5)
+    assert compute_unos_c_index(times=t_tied_ec, events=e_tied_ec, scores=s_equal) == 0.5000
+
+    # Case 6: Censoring survival crossing 0.05 (tau truncation)
+    t_cross = np.arange(1.0, 31.0)
+    e_cross = np.array([0] * 28 + [1, 1])
+    s_cross = np.random.uniform(0, 1, size=30)
+    assert compute_unos_c_index(times=t_cross, events=e_cross, scores=s_cross) == ref_uno(t_cross, e_cross, s_cross)
+
+    # Case 7: Explicit tau provided
+    assert compute_unos_c_index(times=t_heavy, events=e_heavy, scores=s_heavy, tau=150.0) == ref_uno(t_heavy, e_heavy, s_heavy, tau=150.0)
+
+    # Case 8: Unevaluable cases
+    assert compute_unos_c_index(times=t_no_cens, events=np.zeros_like(e_no_cens), scores=s_no_cens) is None
+    assert compute_unos_c_index(times=[], events=[], scores=[]) is None
+    assert compute_unos_c_index(times=[10.0], events=[1], scores=[0.5]) is None
 
 
 def test_adversarial_unos_ipcw_c_index_mathematical_rigor():

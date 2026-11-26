@@ -281,6 +281,8 @@ def load_pancan_master_data(
     Loads pre-harmonized ComBat-adjusted PanCanAtlas master expression matrix covering all 33 TCGA cohorts
     (EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp: ~24.5 GB uncompressed text / ~3.5 GB Parquet).
     Enforces strict survival endpoint selection (PFI vs OS) without silent fallback.
+    Applies identical patient-level deduplication (sample type prioritization), exclusion of missing/invalid
+    events and non-positive follow-up times, and strict alignment assertions as load_cohort_data().
     """
     endpoint = endpoint.strip().upper()
     if endpoint not in ("PFI", "OS"):
@@ -292,8 +294,10 @@ def load_pancan_master_data(
     path_cdr  = XENA_DIR / "TCGA_CDR_survival.tsv"
 
     if not pq_path.exists() and not tsv_path.exists():
+        log.info("PanCanAtlas master matrix files not found on disk (%s / %s).", pq_path, tsv_path)
         return None
     if not path_cdr.exists():
+        log.info("TCGA-CDR survival matrix not found on disk (%s).", path_cdr)
         return None
 
     try:
@@ -319,42 +323,102 @@ def load_pancan_master_data(
             elif s[:12] in cdr_sample_set:
                 sample_to_cdr[s] = s[:12]
 
-        valid_samples = [
+        valid_samples_temp = [
             s for s in tumor_samples
             if s in sample_to_cdr and pd.isna(df_cdr.loc[sample_to_cdr[s], "Redaction"])
         ]
 
-        sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
-        sub_cdr.index = valid_samples
+        # Patient-level grouping and primary tumor prioritization (-01 primary over -02 recurrent, etc.)
+        patient_sample_map: Dict[str, List[str]] = {}
+        for s in valid_samples_temp:
+            pt_id = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
+            patient_sample_map.setdefault(pt_id, []).append(s)
 
-        event_col = f"{endpoint}"
-        time_col = f"{endpoint}.time"
-        if event_col not in sub_cdr.columns or time_col not in sub_cdr.columns:
-            log.warning("Endpoint '%s' columns not found in TCGA-CDR. Silent fallback is prohibited.", endpoint)
+        deduplicated_samples = []
+        duplicate_samples_excluded = 0
+        for pt_id, s_list in patient_sample_map.items():
+            if len(s_list) == 1:
+                deduplicated_samples.append(s_list[0])
+            else:
+                duplicate_samples_excluded += (len(s_list) - 1)
+                # Prioritize primary solid tumor (-01), then recurrent (-02), etc.
+                def _sample_type_sort_key(barcode: str) -> int:
+                    parts = barcode.split("-")
+                    if len(parts) >= 4 and len(parts[3]) >= 2:
+                        stype = parts[3][:2]
+                        if stype.isdigit():
+                            return int(stype)
+                    return 99
+                sorted_s = sorted(s_list, key=_sample_type_sort_key)
+                deduplicated_samples.append(sorted_s[0])
+
+        sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in deduplicated_samples]].copy()
+        sub_cdr.index = deduplicated_samples
+
+        # Strict PFI vs OS endpoint extraction (NO SILENT FALLBACK)
+        if endpoint == "PFI":
+            if "PFI" not in sub_cdr.columns or "PFI.time" not in sub_cdr.columns:
+                log.warning("PFI or PFI.time not in TCGA-CDR. Silent fallback to OS is prohibited.")
+                return None
+            event_col = "PFI"
+            time_col = "PFI.time"
+        elif endpoint == "OS":
+            if "OS" not in sub_cdr.columns or "OS.time" not in sub_cdr.columns:
+                log.warning("OS or OS.time not in TCGA-CDR. Silent fallback to PFI is prohibited.")
+                return None
+            event_col = "OS"
+            time_col = "OS.time"
+
+        # Explicitly exclude missing events (no fillna(0)) and non-positive follow-up times
+        raw_events = pd.to_numeric(sub_cdr[event_col], errors="coerce")
+        raw_times = pd.to_numeric(sub_cdr[time_col], errors="coerce")
+
+        valid_endpoint_mask = (
+            raw_events.notna() &
+            raw_events.isin([0, 1]) &
+            raw_times.notna() &
+            (raw_times > 0)
+        )
+        final_samples = [s for s in deduplicated_samples if valid_endpoint_mask.loc[s]]
+
+        if len(final_samples) < 50:
+            log.warning("Insufficient valid endpoint samples in PanCanAtlas master matrix (%d < 50).", len(final_samples))
             return None
 
-        event_series = pd.to_numeric(sub_cdr[event_col], errors="coerce").fillna(0).astype(int)
-        time_series  = pd.to_numeric(sub_cdr[time_col], errors="coerce").fillna(0).astype(float)
+        event_series = raw_events.loc[final_samples].astype(int)
+        time_series = raw_times.loc[final_samples].astype(float)
 
         is_high_risk = (event_series == 1) & (time_series <= horizon_days)
         is_low_risk  = (time_series >= horizon_days)
         landmark_mask = is_high_risk | is_low_risk
-        eval_samples  = [s for s in valid_samples if landmark_mask.loc[s]]
+        eval_samples  = [s for s in final_samples if landmark_mask.loc[s]]
 
         if len(eval_samples) < 50:
-            log.warning("Insufficient valid landmark samples in PanCanAtlas master matrix.")
+            log.warning("Insufficient valid landmark samples in PanCanAtlas master matrix (%d < 50).", len(eval_samples))
             return None
 
         y_series = pd.Series(0, index=eval_samples, dtype=int)
         y_series.loc[[s for s in eval_samples if is_high_risk.loc[s]]] = 1
+        time_eval = time_series.loc[eval_samples]
+        event_eval = event_series.loc[eval_samples]
 
         X = df_expr[eval_samples].T.fillna(0.0).astype(np.float32)
         del df_expr
         import gc; gc.collect()
 
-        log.info("  Unified PanCanAtlas Master Matrix Loaded: %d patients (%d High Risk / %d Low Risk at %d days)",
-                 len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days)
-        return X, y_series, time_series.loc[eval_samples], event_series.loc[eval_samples]
+        # Strict alignment assertions
+        assert (X.index == y_series.index).all(), "PanCan master expression index and label index misaligned"
+        assert (X.index == time_eval.index).all(), "PanCan master expression index and time index misaligned"
+        assert (X.index == event_eval.index).all(), "PanCan master expression index and event index misaligned"
+        assert not event_eval.isna().any(), "PanCan master loader contains NaN events"
+        assert (time_eval > 0).all(), "PanCan master loader contains non-positive follow-up times"
+        assert set(event_eval.unique()).issubset({0, 1}), "PanCan master loader events not in {0, 1}"
+
+        log.info(
+            "  Unified PanCanAtlas Master Matrix Loaded: %d patients (%d High Risk / %d Low Risk at %d days, %d duplicate biospecimens excluded)",
+            len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days, duplicate_samples_excluded
+        )
+        return X, y_series, time_eval, event_eval
     except Exception as e:
         log.warning("Failed loading PanCanAtlas master matrix (%s). Falling back to individual cohorts.", e)
         return None
@@ -476,10 +540,14 @@ def load_cohort_data(
         time_col = "OS.time"
 
     # Exclude patients with missing or non-positive follow-up time
+    # Strictly require event in {0, 1} and time > 0 (prohibit silent conversion of NaN to censored)
+    raw_cohort_events = pd.to_numeric(sub_cdr[event_col], errors="coerce")
+    raw_cohort_times = pd.to_numeric(sub_cdr[time_col], errors="coerce")
     valid_endpoint_mask = (
-        sub_cdr[event_col].notna() &
-        sub_cdr[time_col].notna() &
-        (pd.to_numeric(sub_cdr[time_col], errors="coerce") > 0)
+        raw_cohort_events.notna() &
+        raw_cohort_events.isin([0, 1]) &
+        raw_cohort_times.notna() &
+        (raw_cohort_times > 0)
     )
     missing_followup_excluded = int((~valid_endpoint_mask).sum())
     final_samples = [s for s in deduplicated_samples if valid_endpoint_mask.loc[s]]
@@ -489,8 +557,8 @@ def load_cohort_data(
             f"Cohort TCGA-{cancer} is unevaluable for endpoint '{endpoint}': 0 patients with valid follow-up."
         )
 
-    event_series = pd.to_numeric(sub_cdr.loc[final_samples, event_col], errors="coerce").fillna(0).astype(int)
-    time_series = pd.to_numeric(sub_cdr.loc[final_samples, time_col], errors="coerce").astype(float)
+    event_series = raw_cohort_events.loc[final_samples].astype(int)
+    time_series = raw_cohort_times.loc[final_samples].astype(float)
 
     n_events = int(event_series.sum())
     n_total = len(final_samples)
@@ -535,10 +603,21 @@ def load_cohort_data(
     del df_expr
     import gc; gc.collect()
 
+    t_eval = time_series.loc[eval_samples]
+    e_eval = event_series.loc[eval_samples]
+
+    # Strict alignment assertions
+    assert (X.index == y_series.index).all(), f"Cohort TCGA-{cancer} expression index and label index misaligned"
+    assert (X.index == t_eval.index).all(), f"Cohort TCGA-{cancer} expression index and time index misaligned"
+    assert (X.index == e_eval.index).all(), f"Cohort TCGA-{cancer} expression index and event index misaligned"
+    assert not e_eval.isna().any(), f"Cohort TCGA-{cancer} contains NaN events"
+    assert (t_eval > 0).all(), f"Cohort TCGA-{cancer} contains non-positive follow-up times"
+    assert set(e_eval.unique()).issubset({0, 1}), f"Cohort TCGA-{cancer} events not in {0, 1}"
+
     log.info("  Cohort TCGA-%s: %d total tumor samples -> %d landmark patients (%d High Risk / %d Low Risk at %d days)",
              cancer, len(tumor_samples), len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days)
 
-    return X, y_series, time_series.loc[eval_samples], event_series.loc[eval_samples]
+    return X, y_series, t_eval, e_eval
 
 
 def clean_matrix_axes(
@@ -585,11 +664,16 @@ def extract_unified_cohort(
     normalize_batches: bool = False,
     include_external: bool = False,
     endpoint: str = "PFI",
-) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
+    return_provenance: bool = False,
+) -> Union[
+    Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray],
+    Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]],
+]:
     """
     Loads and unifies single or pan-organ multi-cancer cohorts for specified endpoint (PFI or OS).
     NOTE: include_external is strictly False by default to prevent external validation contamination
     (METABRIC and GSE31210 must remain completely isolated as true external hospital test sets).
+    Tracks explicit data provenance and fallback status.
     """
     is_global_all = cohort_name.upper() in ("PAN-CANCER-ALL", "ALL", "GLOBAL", "ALL-CONSOLIDATED")
     all_X = []
@@ -599,19 +683,31 @@ def extract_unified_cohort(
 
     # Priority 1: If training PAN-CANCER-ALL, check for unified PanCanAtlas ComBat master matrix
     loaded_master = False
+    master_fallback_reason = None
     if is_global_all:
-        master_data = load_pancan_master_data(horizon_days=horizon_days, endpoint=endpoint)
-        if master_data is not None:
-            X_m, y_m, t_m, e_m = master_data
-            X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
-            all_X.append(X_m)
-            all_y.append(y_m)
-            all_time.append(t_m)
-            all_event.append(e_m)
-            loaded_master = True
+        try:
+            master_data = load_pancan_master_data(horizon_days=horizon_days, endpoint=endpoint)
+            if master_data is not None:
+                X_m, y_m, t_m, e_m = master_data
+                X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
+                all_X.append(X_m)
+                all_y.append(y_m)
+                all_time.append(t_m)
+                all_event.append(e_m)
+                loaded_master = True
+            else:
+                master_fallback_reason = "Master matrix files not found on disk or insufficient landmark samples (<50)"
+        except Exception as exc:
+            master_fallback_reason = f"Exception loading master matrix: {str(exc)}"
+            log.warning("Master matrix failed: %s", exc)
 
     # Priority 2: Ingest individual organ cohorts if master matrix not loaded
     if not loaded_master:
+        if is_global_all:
+            log.info(
+                "  [PROVENANCE] Fallback to individual cohort aggregation activated (Reason: %s)",
+                master_fallback_reason
+            )
         cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
         for c in cancer_codes:
             log.info("  Loading clinical genomics for: TCGA-%s (endpoint: %s)...", c, endpoint)
@@ -707,8 +803,30 @@ def extract_unified_cohort(
     times = np.concatenate([t_s.values for t_s in all_time]).astype(np.float32)
     events = np.concatenate([e_s.values for e_s in all_event]).astype(np.int32)
 
-    log.info("  Unified %s Single-Flow Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors)",
-             cohort_name, len(y), int((y == 1).sum()), int((y == 0).sum()))
+    if loaded_master:
+        data_provenance = "pancan_master_combat_matrix"
+        master_matrix_fallback = False
+        master_fallback_reason = None
+    elif is_global_all:
+        data_provenance = "individual_cohort_aggregation_fallback"
+        master_matrix_fallback = True
+        master_fallback_reason = master_fallback_reason or "PanCan master matrix not loaded"
+    else:
+        data_provenance = f"individual_cohort_{cohort_name}"
+        master_matrix_fallback = False
+        master_fallback_reason = None
+
+    provenance_info = {
+        "data_provenance": data_provenance,
+        "master_matrix_fallback": master_matrix_fallback,
+        "master_fallback_reason": master_fallback_reason,
+    }
+
+    log.info("  Unified %s Single-Flow Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors) | Provenance: %s",
+             cohort_name, len(y), int((y == 1).sum()), int((y == 0).sum()), data_provenance)
+
+    if return_provenance:
+        return X_df, y, times, events, provenance_info
     return X_df, y, times, events
 
 
@@ -784,12 +902,13 @@ def train_strong_risk_model(
     log.info("=" * 76)
 
     # 1. Load Raw Patient Expression and Clinical Outcomes
-    X_raw_df, y, times, events = extract_unified_cohort(
+    X_raw_df, y, times, events, provenance = extract_unified_cohort(
         cohort_name,
         horizon_days=horizon_days,
         normalize_batches=normalize_batches,
         include_external=include_external,
         endpoint=endpoint,
+        return_provenance=True,
     )
 
     # 2. Stratified 80/20 Partition
@@ -952,6 +1071,9 @@ def train_strong_risk_model(
             "architecture" : "StackingEnsemble(ElasticNet + XGBoost + ExtraTrees)",
             "endpoint"     : f"TCGA-CDR {endpoint}",
             "ipcw_weighted": True,
+            "data_provenance": provenance["data_provenance"],
+            "master_matrix_fallback": provenance["master_matrix_fallback"],
+            "master_fallback_reason": provenance["master_fallback_reason"],
             "trained_at"   : datetime.datetime.now().isoformat(),
         }
     }
@@ -968,6 +1090,9 @@ def train_strong_risk_model(
         "horizon_days"     : horizon_days,
         "architecture"     : "StackingEnsemble(ElasticNet + XGBoost + ExtraTrees)",
         "endpoint"         : f"TCGA-CDR {endpoint}",
+        "data_provenance"  : provenance["data_provenance"],
+        "master_matrix_fallback": provenance["master_matrix_fallback"],
+        "master_fallback_reason": provenance["master_fallback_reason"],
         "n_samples"        : len(y),
         "n_high_risk"      : int((y == 1).sum()),
         "n_low_risk"       : int((y == 0).sum()),

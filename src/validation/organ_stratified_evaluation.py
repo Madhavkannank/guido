@@ -444,7 +444,8 @@ def evaluate_organ_stratified_performance(
         uno_c = compute_unos_c_index(times, events, scores)
         pairs = harrell_res["comparable_pairs"]
         c_val = harrell_res["c_index"]
-        se_val = harrell_res["standard_error"] or 0.05
+        raw_se = harrell_res.get("standard_error")
+        se_val = 0.05 if raw_se is None else float(raw_se)
 
         # Wald test p-value testing H0: C = 0.5 (random guessing)
         if se_val > 0:
@@ -571,7 +572,19 @@ class OrganConditionedRiskAdjuster:
         else:
             # Empirical percentile interpolation using frozen 5th..95th quantiles
             pct_steps = [p for p in range(5, 100, 5)]
-            q_vals = [dist[f"q_{p}"] for p in pct_steps]
+            if "quantiles" in dist and isinstance(dist["quantiles"], dict):
+                # Compatible with DeployableOrganScorer serialized format
+                q_dict = dist["quantiles"]
+                q_vals = []
+                for p in pct_steps:
+                    key1 = f"{p / 100.0:.2f}"
+                    key2 = f"q_{p}"
+                    val = q_dict.get(key1, dist.get(key2, None))
+                    if val is None:
+                        val = q_dict.get(str(p / 100.0), dist.get(str(p), 0.0))
+                    q_vals.append(float(val))
+            else:
+                q_vals = [dist[f"q_{p}"] for p in pct_steps]
             # Use linear interpolation
             pct = np.interp(score, q_vals, [p / 100.0 for p in pct_steps], left=0.01, right=0.99)
             return float(pct)
@@ -612,13 +625,13 @@ def _parse_stage_to_numeric(stage_val: Any) -> Optional[float]:
     if stage_val is None or pd.isna(stage_val) or stage_val == "":
         return None
     s_str = str(stage_val).strip().upper()
-    if "STAGE IV" in s_str or re.search(r"\b(IV|4)\b", s_str):
+    if "STAGE IV" in s_str or re.search(r"\b(IV[ABC]?|4[ABC]?)\b", s_str) or re.search(r"^IV[ABC]?$", s_str):
         return 4.0
-    elif "STAGE III" in s_str or re.search(r"\b(III|3)\b", s_str):
+    elif "STAGE III" in s_str or re.search(r"\b(III[ABC]?|3[ABC]?)\b", s_str) or re.search(r"^III[ABC]?$", s_str):
         return 3.0
-    elif "STAGE II" in s_str or re.search(r"\b(II|2)\b", s_str):
+    elif "STAGE II" in s_str or re.search(r"\b(II[ABC]?|2[ABC]?)\b", s_str) or re.search(r"^II[ABC]?$", s_str):
         return 2.0
-    elif "STAGE I" in s_str or re.search(r"\b(I|1)\b", s_str):
+    elif "STAGE I" in s_str or re.search(r"\b(I[ABC]?|1[ABC]?)\b", s_str) or re.search(r"^I[ABC]?$", s_str):
         return 1.0
     return None
 
