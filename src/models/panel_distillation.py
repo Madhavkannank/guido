@@ -1,7 +1,7 @@
 """
 Minimal Gene Panel Distillation Engine (Penalized Cox & Stability Selection)
 =============================================================================
-Distills high-dimensional transcriptomic models (20,000+ genes) down to minimal,
+Distills high-dimensional transcriptomic models down to minimal,
 clinically assayable candidate panels (15, 25, 35, 50 genes) using genuine
 survival analysis (ElasticNet/L1-penalized Cox Proportional Hazards regression).
 
@@ -10,11 +10,17 @@ Scientific Safeguards & Methodology:
      status. Does NOT binarize survival times or substitute a binary classifier.
   2. Zero-Leakage Nested CV: Preprocessing (scaling), feature screening, stability selection,
      and model fitting are executed strictly within outer training folds.
-  3. Out-of-Fold Evaluation: Retention curves and candidate panel performance metrics
-     are computed exclusively on out-of-fold held-out validation predictions.
-  4. Stability Selection (Meinshausen & Bühlmann): Resampling within training partitions
+  3. Patient-Grouped Cross-Validation: Evaluates multi-sample cohorts using GroupKFold
+     grouped by 12-character patient barcode to eliminate patient leakage.
+  4. Out-of-Fold Evaluation Integrity: Out-of-fold prediction buffers are initialized
+     to NaN and monitored with explicit coverage tracking. Failed folds never inject
+     fabricated zero-risk scores.
+  5. Comparator Transparency: Explicitly reports original feature universe, screened
+     feature universe, and comparator model type ("screened_high_dimensional_comparator").
+     Retention is computed strictly against this fitted comparator.
+  6. Stability Selection (Meinshausen & Bühlmann): Resampling within training partitions
      measures empirical feature selection probability and coefficient direction.
-  5. Provenance Discipline: Explicitly records whether input data is synthetic or real TCGA,
+  7. Provenance Discipline: Explicitly records whether input data is synthetic or real TCGA,
      preserves endpoint definitions (PFI/OS), and flags in-silico validation status.
 """
 from __future__ import annotations
@@ -28,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.preprocessing import StandardScaler
 
 from src.validation.organ_stratified_evaluation import (
@@ -59,16 +65,35 @@ TISSUE_VARIABLE_HOUSEKEEPING_CONTROLS: List[str] = ["HPRT1", "B2M", "PGK1"]
 HOUSEKEEPING_CONTROLS: List[str] = QUALIFIED_HOUSEKEEPING_CONTROLS
 
 
+def extract_tcga_patient_ids(sample_ids: Union[List[str], pd.Index, np.ndarray]) -> np.ndarray:
+    """
+    Extracts 12-character patient barcode from TCGA sample IDs
+    (e.g., 'TCGA-BP-4965-01A-...' -> 'TCGA-BP-4965').
+    Preserves non-TCGA sample IDs unchanged.
+    """
+    pts = []
+    for s in sample_ids:
+        s_str = str(s).strip()
+        parts = s_str.split("-")
+        if len(parts) >= 3 and parts[0] == "TCGA":
+            pts.append("-".join(parts[:3]))
+        elif len(s_str) >= 12 and s_str.startswith("TCGA-"):
+            pts.append(s_str[:12])
+        else:
+            pts.append(s_str)
+    return np.array(pts)
+
+
 @dataclass
 class CandidatePanel:
     """Represents a distilled candidate clinical gene panel."""
     panel_size: int
     genes: List[str]
     weights: Dict[str, float]
-    c_index: float  # Genuine out-of-fold Harrell's C-index
-    c_index_ci: List[float]  # Out-of-fold 95% bootstrap confidence interval
-    unos_c_index: float  # Out-of-fold Uno's IPCW C-index
-    retention_ratio: float  # Out-of-fold retention relative to full model
+    c_index: Optional[float]  # Genuine out-of-fold Harrell's C-index
+    c_index_ci: Optional[List[float]]  # Out-of-fold 95% bootstrap confidence interval
+    unos_c_index: Optional[float]  # Out-of-fold Uno's IPCW C-index
+    retention_ratio: float  # Out-of-fold retention relative to comparator model
     hallmark_representation: Dict[str, int]
     biotypes: Dict[str, int]
     assay_type_recommendation: str
@@ -76,6 +101,9 @@ class CandidatePanel:
     evidence_level: str = "in_silico_unvalidated"
     sample_count: int = 0
     event_count: int = 0
+    fitted_feature_count: int = 0
+    comparator_feature_count: int = 0
+    comparator_type: str = "screened_high_dimensional_comparator"
 
 
 @dataclass
@@ -88,14 +116,29 @@ class DistillationReport:
     n_samples: int
     n_events: int
     censoring_rate: float
-    full_model_gene_count: int
-    full_model_c_index: float  # Out-of-fold
-    full_model_c_index_ci: List[float]
-    full_model_unos_c_index: float
+    full_model_gene_count: int  # Comparator feature count (backward compatibility alias)
+    full_model_c_index: Optional[float]  # Comparator out-of-fold C-index (backward compatibility alias)
+    full_model_c_index_ci: Optional[List[float]]
+    full_model_unos_c_index: Optional[float]
     candidate_panels: Dict[int, CandidatePanel]
     retention_curve: List[Dict[str, Any]]
     stability_rankings: List[Dict[str, Any]]
     limitations: List[str] = field(default_factory=list)
+    # Scientific integrity audit fields
+    original_feature_count: int = 0
+    screened_feature_count: int = 0
+    comparator_feature_count: int = 0
+    comparator_type: str = "screened_high_dimensional_comparator"
+    comparator_c_index: Optional[float] = None
+    comparator_c_index_ci: Optional[List[float]] = None
+    comparator_unos_c_index: Optional[float] = None
+    cv_strategy: str = "row_level_kfold"
+    patient_count: int = 0
+    patient_grouping_status: str = "unverified"
+    oof_coverage_ratio: float = 1.0
+    oof_missing_count: int = 0
+    fold_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    evaluation_status: str = "complete"
 
 
 def _compute_univariate_survival_concordance(
@@ -162,15 +205,18 @@ class MinimalGenePanelDistiller:
     def fit(
         self,
         df_X: pd.DataFrame,
-        times: np.ndarray,
-        events: np.ndarray,
+        times: Union[pd.Series, np.ndarray],
+        events: Union[pd.Series, np.ndarray],
+        patient_ids: Optional[Union[pd.Series, np.ndarray, List[str]]] = None,
+        sample_ids: Optional[Union[pd.Series, np.ndarray, List[str]]] = None,
         data_source: str = "synthetic",
         is_synthetic: bool = True,
         endpoint: str = "PFI",
+        require_complete_oof: bool = False,
     ) -> DistillationReport:
         """
         Runs stability selection across CV folds to rank genes and extract candidate panels.
-        All validation metrics are computed OUT-OF-FOLD.
+        All validation metrics are computed strictly OUT-OF-FOLD.
         """
         feature_names = list(df_X.columns)
         n_features = len(feature_names)
@@ -200,24 +246,105 @@ class MinimalGenePanelDistiller:
             n_samples, n_events, censoring_rate * 100, n_features
         )
 
-        # ─── Step 1: Out-of-Fold Nested Cross-Validation ─────────────────────
-        kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_state)
-        oof_full_scores = np.zeros(n_samples, dtype=float)
+        # ─── Step 0: Patient Identification & Cross-Validation Strategy ──────
+        extracted_patients: Optional[np.ndarray] = None
+        if patient_ids is not None:
+            extracted_patients = extract_tcga_patient_ids(patient_ids)[valid_mask]
+        elif sample_ids is not None:
+            extracted_patients = extract_tcga_patient_ids(sample_ids)[valid_mask]
+        elif hasattr(df_X, "index") and len(df_X.index) > 0:
+            first_idx = str(df_X.index[0])
+            if first_idx.startswith("TCGA-"):
+                extracted_patients = extract_tcga_patient_ids(df_X.index)[valid_mask]
+                logger.info(
+                    "Auto-extracted TCGA patient barcodes from sample index (N=%d samples -> %d unique patients)",
+                    n_samples, len(np.unique(extracted_patients))
+                )
 
-        curve_sizes = sorted(list(set(self.panel_sizes + [5, 10, min(50, n_features)])))
+        if extracted_patients is not None:
+            unique_patients = np.unique(extracted_patients)
+            n_patients = len(unique_patients)
+            if n_patients >= self.n_folds:
+                gkf = GroupKFold(n_splits=self.n_folds)
+                splits = list(gkf.split(X, groups=extracted_patients))
+                cv_strategy = f"Patient-Grouped GroupKFold (N={n_patients} patients, {self.n_folds} folds)"
+                patient_grouping_status = "patient_grouped_strictly_partitioned"
+                # Adversarial verification: verify 0 patient overlap across all folds
+                for f_i, (tr_i, val_i) in enumerate(splits):
+                    overlap = set(extracted_patients[tr_i]).intersection(set(extracted_patients[val_i]))
+                    if len(overlap) > 0:
+                        raise ValueError(f"Patient overlap detected in fold {f_i}: {overlap}")
+            else:
+                kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_state)
+                splits = list(kf.split(X))
+                cv_strategy = f"Row-Level KFold ({self.n_folds} folds, insufficient unique patients: {n_patients} < {self.n_folds})"
+                patient_grouping_status = "row_level_insufficient_unique_patients"
+        else:
+            kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_state)
+            splits = list(kf.split(X))
+            cv_strategy = f"Row-Level KFold ({self.n_folds} folds, unverified patient grouping)"
+            patient_grouping_status = "row_level_ungrouped_patient_ids_unavailable"
+            n_patients = n_samples
+
+        # ─── Step 1: Comparator Definition & OOF Buffer Initialization ───────
+        original_feature_count = n_features
+        if n_features > self.max_screen_features:
+            comparator_type = "screened_high_dimensional_comparator"
+            comparator_feature_count = self.max_screen_features
+            screened_feature_count = self.max_screen_features
+        else:
+            comparator_type = "complete_feature_universe_model"
+            comparator_feature_count = n_features
+            screened_feature_count = n_features
+
+        # Strict integrity: Initialize OOF predictions to NaN (never zero)
+        oof_comparator_scores = np.full(n_samples, np.nan, dtype=float)
+        max_possible_size = min(n_features, self.max_screen_features)
+        curve_sizes = sorted(list(set(
+            [s for s in self.panel_sizes if s <= max_possible_size] +
+            [s for s in [5, 10, min(50, max_possible_size)] if s <= max_possible_size]
+        )))
         oof_panel_scores: Dict[int, np.ndarray] = {
-            s: np.zeros(n_samples, dtype=float) for s in curve_sizes if s <= n_features
+            s: np.full(n_samples, np.nan, dtype=float) for s in curve_sizes
         }
 
         selection_counts = np.zeros(n_features, dtype=float)
         summed_coefs = np.zeros(n_features, dtype=float)
+        fold_diagnostics: List[Dict[str, Any]] = []
 
-        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X)):
+        # ─── Step 2: Out-of-Fold Nested Cross-Validation Loop ────────────────
+        for fold_idx, (train_idx, val_idx) in enumerate(splits):
             X_tr, X_val = X[train_idx], X[val_idx]
             t_tr, t_val = times[train_idx], times[val_idx]
             e_tr, e_val = events[train_idx], events[val_idx]
 
+            fold_diag = {
+                "fold_idx": fold_idx,
+                "n_train_samples": len(train_idx),
+                "n_val_samples": len(val_idx),
+                "n_train_events": int(np.sum(e_tr == 1)),
+                "n_val_events": int(np.sum(e_val == 1)),
+                "fit_success": False,
+                "failure_reason": None,
+                "fitted_comparator_features": 0,
+                "patient_overlap_count": 0,
+                "patient_overlap_detected": False,
+                "n_train_patients": len(train_idx),
+                "n_val_patients": len(val_idx),
+            }
+
+            if extracted_patients is not None:
+                tr_pts = set(extracted_patients[train_idx])
+                val_pts = set(extracted_patients[val_idx])
+                overlap = tr_pts.intersection(val_pts)
+                fold_diag["patient_overlap_count"] = len(overlap)
+                fold_diag["patient_overlap_detected"] = len(overlap) > 0
+                fold_diag["n_train_patients"] = len(tr_pts)
+                fold_diag["n_val_patients"] = len(val_pts)
+
             if np.sum(e_tr == 1) < 3:
+                fold_diag["failure_reason"] = "Insufficient training events (<3)"
+                fold_diagnostics.append(fold_diag)
                 logger.warning("Fold %d has < 3 events in training set; skipping.", fold_idx)
                 continue
 
@@ -226,14 +353,13 @@ class MinimalGenePanelDistiller:
             X_tr_sc = scaler.fit_transform(X_tr)
             X_val_sc = scaler.transform(X_val)
 
-            # Feature screening if p > max_screen_features
+            # Feature screening strictly within training fold if p > max_screen_features
             if n_features > self.max_screen_features:
                 univ_scores = _compute_univariate_survival_concordance(X_tr_sc, t_tr, e_tr)
                 screened_indices = np.argsort(-univ_scores)[:self.max_screen_features]
             else:
                 screened_indices = np.arange(n_features)
 
-            # Within-fold stability selection on screened features
             n_screened = len(screened_indices)
             fold_counts = np.zeros(n_screened, dtype=float)
             fold_coefs = np.zeros(n_screened, dtype=float)
@@ -261,7 +387,6 @@ class MinimalGenePanelDistiller:
                     fold_counts += active.astype(float)
                     fold_coefs += b_coefs
                 except Exception:
-                    # In case of numerical issues with small subsamples
                     continue
 
             # Record selection counts for global stability
@@ -274,9 +399,8 @@ class MinimalGenePanelDistiller:
             local_scores = fold_counts / effective_subs + 0.3 * np.abs(fold_coefs / effective_subs)
             local_ranked = screened_indices[np.argsort(-local_scores)]
 
-            # 1. Full Model out-of-fold prediction
+            # 1. Fitted Comparator Model out-of-fold prediction
             try:
-                # Use ridge penalty on screened features for baseline stability
                 df_tr_full = pd.DataFrame(
                     X_tr_sc[:, screened_indices],
                     columns=[f"F_{k}" for k in range(n_screened)]
@@ -286,17 +410,22 @@ class MinimalGenePanelDistiller:
                 cph_full = CoxPHFitter(penalizer=0.05, l1_ratio=0.1)
                 cph_full.fit(df_tr_full, duration_col="time", event_col="event")
                 full_b = cph_full.params_.values
-                oof_full_scores[val_idx] = np.dot(X_val_sc[:, screened_indices], full_b)
+                oof_comparator_scores[val_idx] = np.dot(X_val_sc[:, screened_indices], full_b)
+                fold_diag["fit_success"] = True
+                fold_diag["fitted_comparator_features"] = n_screened
             except Exception as e:
-                logger.warning("Full model fold %d fit exception: %s", fold_idx, e)
+                fold_diag["failure_reason"] = f"Comparator fit failed: {str(e)}"
+                logger.warning("Comparator fold %d fit exception: %s", fold_idx, e)
 
             # 2. Candidate Panel out-of-fold predictions
             for size in oof_panel_scores.keys():
                 top_k = local_ranked[:size]
+                if len(top_k) < size:
+                    continue
                 try:
                     df_tr_panel = pd.DataFrame(
                         X_tr_sc[:, top_k],
-                        columns=[f"P_{k}" for k in range(size)]
+                        columns=[f"P_{k}" for k in range(len(top_k))]
                     )
                     df_tr_panel["time"] = t_tr
                     df_tr_panel["event"] = e_tr
@@ -307,19 +436,68 @@ class MinimalGenePanelDistiller:
                 except Exception as e:
                     logger.warning("Panel size %d fold %d fit exception: %s", size, fold_idx, e)
 
-        # ─── Step 2: Compute Genuine Out-of-Fold Concordance ─────────────────
-        full_res = compute_harrell_c_index_with_ci(times, events, oof_full_scores, n_bootstrap=100)
-        full_c = full_res["c_index"]
-        full_ci = [full_res["ci_lower"], full_res["ci_upper"]]
-        full_uno = compute_unos_c_index(times, events, oof_full_scores)
+            fold_diagnostics.append(fold_diag)
 
+        # ─── Step 3: Out-of-Fold Prediction Coverage & Metric Honesty ────────
+        valid_comp_mask = ~np.isnan(oof_comparator_scores)
+        missing_comparator_count = int(np.sum(~valid_comp_mask))
+        oof_coverage_ratio = round(float(np.sum(valid_comp_mask)) / max(n_samples, 1), 4)
+
+        failed_folds = [f for f in fold_diagnostics if not f["fit_success"]]
+        if missing_comparator_count > 0:
+            evaluation_status = "incomplete_missing_predictions"
+            logger.warning(
+                "Incomplete OOF predictions: %d/%d samples lack valid comparator predictions. Failed folds: %d",
+                missing_comparator_count, n_samples, len(failed_folds)
+            )
+            if require_complete_oof:
+                raise RuntimeError(
+                    f"Cross-validation incomplete: {missing_comparator_count}/{n_samples} samples lack valid OOF predictions. "
+                    f"Failed folds: {len(failed_folds)}. Reasons: {[f['failure_reason'] for f in failed_folds]}"
+                )
+        else:
+            evaluation_status = "complete"
+
+        # Evaluate comparator model on valid OOF predictions
+        if np.sum(valid_comp_mask) > 0 and np.sum(events[valid_comp_mask] == 1) > 0:
+            full_res = compute_harrell_c_index_with_ci(
+                times[valid_comp_mask], events[valid_comp_mask], oof_comparator_scores[valid_comp_mask], n_bootstrap=100
+            )
+            full_c = full_res["c_index"]
+            full_ci = [full_res["ci_lower"], full_res["ci_upper"]]
+            full_uno = compute_unos_c_index(
+                scores=oof_comparator_scores[valid_comp_mask],
+                times=times[valid_comp_mask],
+                events=events[valid_comp_mask]
+            )
+        else:
+            full_c, full_ci, full_uno = None, None, None
+
+        # ─── Step 4: Evaluate Candidate Panels & Retention vs Comparator ─────
         retention_curve: List[Dict[str, Any]] = []
         for size in sorted(oof_panel_scores.keys()):
-            sub_res = compute_harrell_c_index_with_ci(times, events, oof_panel_scores[size], n_bootstrap=100)
-            sub_c = sub_res["c_index"]
-            sub_ci = [sub_res["ci_lower"], sub_res["ci_upper"]]
-            sub_uno = compute_unos_c_index(times, events, oof_panel_scores[size])
-            retention = round(float(sub_c / max(full_c, 0.01)), 4) if full_c > 0.0 else 0.0
+            p_scores = oof_panel_scores[size]
+            valid_p_mask = ~np.isnan(p_scores)
+            n_valid_p = int(np.sum(valid_p_mask))
+
+            if n_valid_p > 0 and np.sum(events[valid_p_mask] == 1) > 0:
+                sub_res = compute_harrell_c_index_with_ci(
+                    times[valid_p_mask], events[valid_p_mask], p_scores[valid_p_mask], n_bootstrap=100
+                )
+                sub_c = sub_res["c_index"]
+                sub_ci = [sub_res["ci_lower"], sub_res["ci_upper"]]
+                sub_uno = compute_unos_c_index(
+                    scores=p_scores[valid_p_mask],
+                    times=times[valid_p_mask],
+                    events=events[valid_p_mask]
+                )
+            else:
+                sub_c, sub_ci, sub_uno = None, None, None
+
+            if full_c is not None and full_c > 0.0 and sub_c is not None:
+                retention = round(float(sub_c / full_c), 4)
+            else:
+                retention = 0.0
 
             retention_curve.append({
                 "panel_size": size,
@@ -327,9 +505,11 @@ class MinimalGenePanelDistiller:
                 "ci_95": sub_ci,
                 "unos_c_index": sub_uno,
                 "retention_ratio": retention,
+                "oof_valid_samples": n_valid_p,
+                "oof_missing_samples": n_samples - n_valid_p,
             })
 
-        # ─── Step 3: Global Consensus Stability Ranking on Full Data ─────────
+        # ─── Step 5: Global Consensus Stability Ranking on Full Data ─────────
         total_folds = max(1.0, float(self.n_folds))
         stability_prob = selection_counts / total_folds
         mean_coefs = summed_coefs / total_folds
@@ -354,7 +534,7 @@ class MinimalGenePanelDistiller:
             for rank, idx in enumerate(ranked_indices[:min(100, n_features)])
         ]
 
-        # ─── Step 4: Final Candidate Panels Annotation ───────────────────────
+        # ─── Step 6: Final Candidate Panels Annotation ───────────────────────
         candidate_panels: Dict[int, CandidatePanel] = {}
 
         # Scale full dataset for consensus panel weight calculation
@@ -396,7 +576,7 @@ class MinimalGenePanelDistiller:
                 panel_uno = curve_entry["unos_c_index"]
                 retention = curve_entry["retention_ratio"]
             else:
-                panel_c, panel_ci, panel_uno, retention = 0.5, [0.5, 0.5], 0.5, 0.5
+                panel_c, panel_ci, panel_uno, retention = None, None, None, 0.0
 
             hallmarks = self._annotate_hallmarks(sub_genes)
             biotypes = self._annotate_biotypes(sub_genes)
@@ -417,25 +597,32 @@ class MinimalGenePanelDistiller:
                 evidence_level="in_silico_unvalidated",
                 sample_count=n_samples,
                 event_count=n_events,
+                fitted_feature_count=len(sub_genes),
+                comparator_feature_count=comparator_feature_count,
+                comparator_type=comparator_type,
             )
 
         limitations = [
             "In-silico candidate gene panels require prospective analytical and clinical validation.",
             "Primer and probe efficiency has not been measured experimentally.",
-            "Performance retention is evaluated via out-of-fold cross-validation on available cohorts.",
+            f"Performance retention ({retention * 100:.1f}%) is calculated strictly relative to the "
+            f"{comparator_feature_count}-gene {comparator_type}, NOT against the complete {original_feature_count}-gene universe.",
+            f"Cross-validation executed via {cv_strategy}; patient grouping status: {patient_grouping_status}.",
         ]
         if is_synthetic:
             limitations.append("EVALUATED ON SYNTHETIC BENCHMARK DATASET - NOT REAL PATIENT BIOLOGY.")
+        if evaluation_status != "complete":
+            limitations.append(f"WARNING: Out-of-fold evaluation status is '{evaluation_status}'.")
 
         report = DistillationReport(
             data_source=data_source,
             is_synthetic=is_synthetic,
             endpoint=endpoint,
-            evaluation_method="Nested K-Fold Cross-Validation (Out-of-Fold Predictions)",
+            evaluation_method=f"Nested Cross-Validation ({cv_strategy})",
             n_samples=n_samples,
             n_events=n_events,
             censoring_rate=censoring_rate,
-            full_model_gene_count=n_features,
+            full_model_gene_count=comparator_feature_count,
             full_model_c_index=full_c,
             full_model_c_index_ci=full_ci,
             full_model_unos_c_index=full_uno,
@@ -443,6 +630,20 @@ class MinimalGenePanelDistiller:
             retention_curve=retention_curve,
             stability_rankings=stability_rankings,
             limitations=limitations,
+            original_feature_count=original_feature_count,
+            screened_feature_count=screened_feature_count,
+            comparator_feature_count=comparator_feature_count,
+            comparator_type=comparator_type,
+            comparator_c_index=full_c,
+            comparator_c_index_ci=full_ci,
+            comparator_unos_c_index=full_uno,
+            cv_strategy=cv_strategy,
+            patient_count=n_patients,
+            patient_grouping_status=patient_grouping_status,
+            oof_coverage_ratio=oof_coverage_ratio,
+            oof_missing_count=missing_comparator_count,
+            fold_diagnostics=fold_diagnostics,
+            evaluation_status=evaluation_status,
         )
         self.distillation_report_ = report
         return report
@@ -496,6 +697,7 @@ class MinimalGenePanelDistiller:
         out_p = Path(output_path)
         out_p.parent.mkdir(parents=True, exist_ok=True)
 
+        oof_c_desc = f"{report.comparator_c_index:.4f}" if report.comparator_c_index is not None else "N/A"
         spec = {
             "title": f"GUIDO In-Silico Assay Design Specification — {panel_size}-Gene Candidate Panel",
             "validation_status": "in_silico_candidate",
@@ -504,12 +706,31 @@ class MinimalGenePanelDistiller:
             "training_data_source": report.data_source,
             "survival_endpoint": report.endpoint,
             "panel_size": panel_size,
+            "fitted_gene_count": len(panel.genes),
             "target_genes": panel.genes,
             "gene_weights": panel.weights,
+            "original_feature_universe_count": report.original_feature_count,
+            "screened_feature_count": report.screened_feature_count,
+            "comparator_model_feature_count": report.comparator_feature_count,
+            "comparator_model_type": report.comparator_type,
+            "retention_against_comparator": panel.retention_ratio,
+            "comparator_retention_basis": (
+                f"Retention ratio ({panel.retention_ratio * 100:.1f}%) is calculated strictly relative "
+                f"to the {report.comparator_feature_count}-gene {report.comparator_type} (OOF C-index: {oof_c_desc}), "
+                f"NOT against the complete {report.original_feature_count}-gene universe."
+            ),
+            "cv_strategy": report.cv_strategy,
+            "patient_grouping_status": report.patient_grouping_status,
+            "oof_prediction_coverage": report.oof_coverage_ratio,
+            "evaluation_status": report.evaluation_status,
             "housekeeping_candidate_controls": {
                 "qualified_stable_controls": QUALIFIED_HOUSEKEEPING_CONTROLS,
                 "tissue_variable_controls_to_avoid": TISSUE_VARIABLE_HOUSEKEEPING_CONTROLS,
-                "empirical_basis": "Empirically evaluated across real TCGA cohorts in cross_platform_normalizer.py; RPL13A, ACTB, PPIA, and TBP demonstrate cross-tissue CV < 0.05, while HPRT1, B2M, and PGK1 exhibit significant tissue-specific variation (>0.9 log2 shift)."
+                "empirical_basis": (
+                    "Empirically evaluated across real TCGA cohorts in cross_platform_normalizer.py; "
+                    "RPL13A, ACTB, PPIA, and TBP demonstrate cross-tissue CV < 0.05, while HPRT1, B2M, "
+                    "and PGK1 exhibit significant tissue-specific variation (>0.9 log2 shift)."
+                ),
             },
             "recommended_platform_candidate": panel.assay_type_recommendation,
             "out_of_fold_metrics": {

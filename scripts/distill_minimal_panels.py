@@ -79,6 +79,13 @@ def main() -> int:
     parser.add_argument("--n-genes", type=int, default=80, help="Number of input genes if synthetic")
     parser.add_argument("--n-folds", type=int, default=4, help="Number of outer cross-validation folds")
     parser.add_argument("--output-dir", type=str, default="reports/assay_specs", help="Output directory for assay specs")
+    parser.add_argument(
+        "--endpoint",
+        type=str,
+        default="PFI",
+        choices=["PFI", "OS"],
+        help="Standardized TCGA-CDR survival endpoint: 'PFI' (Progression-Free Interval) or 'OS' (Overall Survival)"
+    )
     args = parser.parse_args()
 
     out_dir = ROOT / args.output_dir
@@ -89,17 +96,17 @@ def main() -> int:
     if not is_synthetic:
         # Real cohort execution path
         cohort_name = args.cohort.upper().replace("TCGA-", "")
-        log.info("[REAL DATA] Loading real TCGA cohort: TCGA-%s", cohort_name)
+        log.info("[REAL DATA] Loading real TCGA cohort: TCGA-%s (endpoint: %s)", cohort_name, args.endpoint)
         try:
             from retrain_fixed import load_cohort_data
-            df_X, y_series, time_series, event_series = load_cohort_data(cohort_name)
+            df_X, y_series, time_series, event_series = load_cohort_data(cohort_name, endpoint=args.endpoint)
             times = time_series.values.astype(float)
             events = event_series.values.astype(int)
             data_source = f"TCGA-{cohort_name}"
-            endpoint = "PFI"
+            endpoint = args.endpoint
             log.info(
-                "[REAL DATA] Loaded TCGA-%s: N=%d patients, %d events (%.1f%% event rate), P=%d genes",
-                cohort_name, len(df_X), int(np.sum(events == 1)),
+                "[REAL DATA] Loaded TCGA-%s (%s): N=%d patients, %d events (%.1f%% event rate), P=%d genes",
+                cohort_name, endpoint, len(df_X), int(np.sum(events == 1)),
                 float(np.mean(events == 1)) * 100, df_X.shape[1]
             )
         except Exception as e:
@@ -158,17 +165,29 @@ def main() -> int:
         "sample_size": report.n_samples,
         "event_count": report.n_events,
         "censoring_rate": report.censoring_rate,
+        "original_feature_universe_count": report.original_feature_count,
+        "screened_feature_count": report.screened_feature_count,
+        "comparator_feature_count": report.comparator_feature_count,
+        "comparator_type": report.comparator_type,
         "full_model_gene_count": report.full_model_gene_count,
-        "full_model_out_of_fold_c_index": round(report.full_model_c_index, 4),
-        "full_model_c_index_95_ci": report.full_model_c_index_ci,
-        "full_model_unos_c_index": round(report.full_model_unos_c_index, 4),
+        "comparator_out_of_fold_c_index": round(report.comparator_c_index, 4) if report.comparator_c_index is not None else None,
+        "comparator_c_index_95_ci": report.comparator_c_index_ci,
+        "comparator_unos_c_index": round(report.comparator_unos_c_index, 4) if report.comparator_unos_c_index is not None else None,
+        "cv_strategy": report.cv_strategy,
+        "patient_count": report.patient_count,
+        "patient_grouping_status": report.patient_grouping_status,
+        "oof_coverage_ratio": report.oof_coverage_ratio,
+        "evaluation_status": report.evaluation_status,
+        "fold_diagnostics": report.fold_diagnostics,
         "candidate_panels": {
             str(k): {
                 "panel_size": v.panel_size,
-                "out_of_fold_c_index": round(v.c_index, 4),
+                "out_of_fold_c_index": round(v.c_index, 4) if v.c_index is not None else None,
                 "c_index_95_ci": v.c_index_ci,
-                "unos_c_index": round(v.unos_c_index, 4),
+                "unos_c_index": round(v.unos_c_index, 4) if v.unos_c_index is not None else None,
                 "retention_ratio": round(v.retention_ratio, 4),
+                "comparator_feature_count": v.comparator_feature_count,
+                "comparator_type": v.comparator_type,
                 "assay_recommendation": v.assay_type_recommendation,
                 "genes": v.genes,
                 "hallmark_coverage": v.hallmark_representation,
@@ -189,19 +208,26 @@ def main() -> int:
 
     log.info("Master distillation report written to: %s", master_path)
 
+    full_c_str = f"{report.comparator_c_index:.4f}" if report.comparator_c_index is not None else "N/A"
+    full_ci_str = f"[{report.comparator_c_index_ci[0]:.4f} - {report.comparator_c_index_ci[1]:.4f}]" if report.comparator_c_index_ci and report.comparator_c_index_ci[0] is not None else "N/A"
+
     print("\n" + "=" * 80)
     print("MINIMAL GENE PANEL DISTILLATION RESULTS (OUT-OF-FOLD EVALUATION)")
     print("=" * 80)
     print(f"Data Source:       {report.data_source} (Synthetic: {report.is_synthetic})")
     print(f"Survival Endpoint: {report.endpoint} (N={report.n_samples}, Events={report.n_events}, Censored={report.censoring_rate:.1%})")
-    print(f"Full Model:        {report.full_model_gene_count} genes | Out-of-Fold C-Index: {report.full_model_c_index:.4f} "
-          f"[95% CI: {report.full_model_c_index_ci[0]:.4f} - {report.full_model_c_index_ci[1]:.4f}]\n")
+    print(f"CV Strategy:       {report.cv_strategy} (Status: {report.patient_grouping_status})")
+    print(f"Feature Universe:  {report.original_feature_count} original genes -> {report.screened_feature_count} screened features")
+    print(f"Comparator Model:  {report.comparator_feature_count} genes ({report.comparator_type}) | Out-of-Fold C-Index: {full_c_str} "
+          f"[95% CI: {full_ci_str}]")
+    print(f"OOF Coverage:      {report.oof_coverage_ratio * 100:.1f}% ({report.evaluation_status})\n")
     print(f"{'Panel Size':<12} | {'OOF C-Index':<12} | {'95% CI':<18} | {'Retention':<10} | {'Status':<15}")
     print("-" * 80)
     for k in sorted(report.candidate_panels.keys()):
         p = report.candidate_panels[k]
-        ci_str = f"[{p.c_index_ci[0]:.3f}, {p.c_index_ci[1]:.3f}]"
-        print(f"{p.panel_size:<12} | {p.c_index:<12.4f} | {ci_str:<18} | {p.retention_ratio * 100:<9.1f}% | {p.validation_status:<15}")
+        c_str = f"{p.c_index:.4f}" if p.c_index is not None else "N/A"
+        ci_str = f"[{p.c_index_ci[0]:.3f}, {p.c_index_ci[1]:.3f}]" if p.c_index_ci and p.c_index_ci[0] is not None else "N/A"
+        print(f"{p.panel_size:<12} | {c_str:<12} | {ci_str:<18} | {p.retention_ratio * 100:<9.1f}% | {p.validation_status:<15}")
     print("=" * 80)
     return 0
 

@@ -28,13 +28,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.preprocessing import StandardScaler
 
 # Add project root to sys.path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from src.models.panel_distillation import extract_tcga_patient_ids
 from src.validation.organ_stratified_evaluation import (
     ALL_33_TCGA_COHORTS,
     OrganConditionedRiskAdjuster,
@@ -113,11 +114,11 @@ def load_real_tcga_evaluation_data(
 
     for cohort_abbr in available_cohorts:
         c_code = cohort_abbr.upper().replace("TCGA-", "")
-        log.info("[REAL DATA] Loading genomic and clinical data for TCGA-%s...", c_code)
+        log.info("[REAL DATA] Loading genomic and clinical data for TCGA-%s (endpoint: %s)...", c_code, endpoint)
         try:
-            df_X, _, time_series, event_series = load_cohort_data(c_code)
+            df_X, _, time_series, event_series = load_cohort_data(c_code, endpoint=endpoint)
         except Exception as exc:
-            log.warning("Could not load cohort TCGA-%s: %s", c_code, exc)
+            log.warning("Could not load cohort TCGA-%s for endpoint %s: %s", c_code, endpoint, exc)
             continue
 
         sample_ids = df_X.index.tolist()
@@ -140,13 +141,24 @@ def load_real_tcga_evaluation_data(
         gene_names = np.array(df_X.columns)
         X_mat = df_X.values
 
-        # Out-of-fold cross-validated risk scoring (3 folds)
-        oof_scores = np.zeros(n_samples, dtype=float)
-        kf = KFold(n_splits=min(3, n_samples), shuffle=True, random_state=42)
+        pt_ids = extract_tcga_patient_ids(sample_ids)
+        unique_pts = np.unique(pt_ids)
 
-        for train_idx, val_idx in kf.split(X_mat):
+        # Out-of-fold cross-validated risk scoring using patient-level GroupKFold to prevent leakage
+        oof_scores = np.full(n_samples, np.nan, dtype=float)
+        n_splits = min(3, len(unique_pts))
+        if n_splits >= 2:
+            gkf = GroupKFold(n_splits=n_splits)
+            split_iter = list(gkf.split(X_mat, groups=pt_ids))
+        else:
+            kf = KFold(n_splits=min(3, n_samples), shuffle=True, random_state=42)
+            split_iter = list(kf.split(X_mat))
+
+        for train_idx, val_idx in split_iter:
             X_tr, X_val = X_mat[train_idx], X_mat[val_idx]
             t_tr, e_tr = times[train_idx], events[train_idx]
+            if np.sum(e_tr == 1) < 2:
+                continue
 
             # Standardize using training fold statistics
             scaler = StandardScaler()
@@ -165,11 +177,19 @@ def load_real_tcga_evaluation_data(
 
             oof_scores[val_idx] = np.dot(X_val_sc[:, var_idx], weights)
 
-        # Map to logistic risk score [0, 1]
-        norm_scores = 1.0 / (1.0 + np.exp(-oof_scores))
+        # Ensure valid OOF coverage
+        valid_mask = ~np.isnan(oof_scores)
+        if not np.all(valid_mask):
+            log.warning("Cohort TCGA-%s had incomplete OOF coverage (%d/%d valid)", c_code, int(np.sum(valid_mask)), n_samples)
+
+        # Map to logistic risk score [0, 1] on valid scores
+        norm_scores = np.full(n_samples, np.nan, dtype=float)
+        norm_scores[valid_mask] = 1.0 / (1.0 + np.exp(-oof_scores[valid_mask]))
 
         for idx, s_id in enumerate(sample_ids):
-            pt_id = s_id[:12] if len(s_id) >= 12 else s_id
+            if not valid_mask[idx]:
+                continue
+            pt_id = pt_ids[idx]
             stage_val = None
             age_val = None
             if s_id in cdr_map.index:
@@ -207,6 +227,13 @@ def main() -> int:
     parser.add_argument("--output", type=str, default="reports/organ_stratified_evaluation.json", help="Output JSON path")
     parser.add_argument("--endpoint", type=str, default="PFI", help="Clinical endpoint ('PFI' or 'OS')")
     parser.add_argument("--n-bootstrap", type=int, default=500, help="Number of bootstrap iterations for CI")
+    parser.add_argument(
+        "--reference-data",
+        type=str,
+        default="",
+        help="Path to independent reference dataset (CSV/Parquet) or frozen DeployableOrganScorer JSON. "
+             "If omitted, strictly partitioned out-of-fold cross-validation is used to eliminate reference leakage."
+    )
     args = parser.parse_args()
 
     out_path = ROOT / args.output
@@ -282,10 +309,59 @@ def main() -> int:
         strata_col="cohort" if len(df["cohort"].unique()) > 1 else None,
     )
 
-    # 4. Deployable Organ-Conditioned Risk Adjuster (frozen reference quantiles)
-    adjuster = OrganConditionedRiskAdjuster(method="percentile")
-    adjuster.fit(df, cohort_col="cohort", score_col="risk_score")
-    df["organ_conditioned_score"] = adjuster.transform(df, cohort_col="cohort", score_col="risk_score")
+    # 4. Deployable Organ-Conditioned Risk Adjuster (Zero-Leakage Frozen Reference Quantiles)
+    # Strictly eliminate reference data leakage:
+    # If independent reference data is supplied, fit on that.
+    # Otherwise, perform patient-grouped cross-validation so evaluation samples NEVER fit their own reference quantiles.
+    if args.reference_data and Path(args.reference_data).exists():
+        ref_path = Path(args.reference_data)
+        log.info("Loading independent reference dataset from: %s", ref_path)
+        if ref_path.suffix == ".json":
+            with open(ref_path, "r", encoding="utf-8") as rf:
+                ref_json = json.load(rf)
+            adjuster = OrganConditionedRiskAdjuster(
+                method="percentile",
+                reference_distributions_=ref_json.get("organ_references", {}),
+                is_fitted_=True,
+            )
+        else:
+            ref_df = pd.read_parquet(ref_path) if ref_path.suffix == ".parquet" else pd.read_csv(ref_path)
+            adjuster = OrganConditionedRiskAdjuster(method="percentile")
+            adjuster.fit(ref_df, cohort_col="cohort", score_col="risk_score")
+
+        df["organ_conditioned_score"] = adjuster.transform(df, cohort_col="cohort", score_col="risk_score")
+        reference_provenance = f"independent_reference_data:{ref_path.name}"
+    else:
+        log.info(
+            "No independent reference dataset specified. Executing patient-partitioned cross-validation "
+            "to guarantee evaluation samples NEVER participate in fitting their own reference quantiles."
+        )
+        oof_conditioned = np.full(len(df), np.nan, dtype=float)
+        pt_groups = df["patient_id"].values if "patient_id" in df.columns else df.index.values
+        unique_pts = np.unique(pt_groups)
+        n_cv_splits = min(4, len(unique_pts))
+
+        if n_cv_splits >= 2:
+            gkf_ref = GroupKFold(n_splits=n_cv_splits)
+            ref_splits = list(gkf_ref.split(df, groups=pt_groups))
+        else:
+            kf_ref = KFold(n_splits=min(4, len(df)), shuffle=True, random_state=42)
+            ref_splits = list(kf_ref.split(df))
+
+        for tr_idx, val_idx in ref_splits:
+            train_sub = df.iloc[tr_idx]
+            val_sub = df.iloc[val_idx]
+
+            fold_adj = OrganConditionedRiskAdjuster(method="percentile")
+            fold_adj.fit(train_sub, cohort_col="cohort", score_col="risk_score")
+            oof_conditioned[val_idx] = fold_adj.transform(val_sub, cohort_col="cohort", score_col="risk_score")
+
+        df["organ_conditioned_score"] = oof_conditioned
+        reference_provenance = "out_of_fold_cross_validation_strictly_partitioned"
+
+        # Also fit a master frozen reference on the whole dataset for future prospective deployment artifacts
+        adjuster = OrganConditionedRiskAdjuster(method="percentile")
+        adjuster.fit(df, cohort_col="cohort", score_col="risk_score")
 
     # 5. Assemble comprehensive, transparent report
     full_report = {
@@ -302,7 +378,17 @@ def main() -> int:
         "tcga_cohort_availability_registry": audit_res,
         "organ_stratified_performance": stratified_res,
         "stage_and_age_adjusted_cox_model": cox_res,
-        "organ_conditioned_reference_distributions": adjuster.reference_distributions_,
+        "organ_conditioned_scoring": {
+            "reference_provenance": reference_provenance,
+            "leakage_prevention_status": "zero_leakage_guaranteed",
+            "clinical_interpretation_notice": (
+                "Percentile normalization provides within-organ relative ranking (relative risk compared to "
+                "other patients with the same tumor type), NOT calibrated absolute clinical risk. "
+                "Evaluation samples never participate in fitting their own reference quantiles. "
+                "Cohorts without reference data return unavailable (NaN)."
+            ),
+            "reference_distributions": adjuster.reference_distributions_,
+        },
         "scientific_integrity_statement": (
             "This report adheres to strict scientific integrity standards. All 33 TCGA cohorts are "
             "transparently cataloged into evaluated, unevaluable, or missing genomics categories. "

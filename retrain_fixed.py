@@ -274,12 +274,18 @@ def is_tumor_sample(s: str) -> bool:
 
 
 def load_pancan_master_data(
-    horizon_days: int = RISK_HORIZON_DAYS
+    horizon_days: int = RISK_HORIZON_DAYS,
+    endpoint: str = "PFI",
 ) -> Optional[Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]]:
     """
     Loads pre-harmonized ComBat-adjusted PanCanAtlas master expression matrix covering all 33 TCGA cohorts
     (EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp: ~24.5 GB uncompressed text / ~3.5 GB Parquet).
+    Enforces strict survival endpoint selection (PFI vs OS) without silent fallback.
     """
+    endpoint = endpoint.strip().upper()
+    if endpoint not in ("PFI", "OS"):
+        raise ValueError(f"Invalid survival endpoint '{endpoint}'. Must be 'PFI' or 'OS'.")
+
     shards_dir = ROOT / "data" / "processed" / "shards"
     pq_path   = shards_dir / "TCGA_PANCAN_EB_ADJUST_expression.parquet"
     tsv_path  = XENA_DIR / "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv"
@@ -291,7 +297,7 @@ def load_pancan_master_data(
         return None
 
     try:
-        log.info("  Found PanCanAtlas ComBat-adjusted Master Matrix! Loading all 33 TCGA cohorts in one flow...")
+        log.info("  Found PanCanAtlas ComBat-adjusted Master Matrix! Loading all 33 TCGA cohorts in one flow (endpoint: %s)...", endpoint)
         if pq_path.exists():
             df_expr = pd.read_parquet(pq_path).dropna(how="all").astype(np.float32)
         else:
@@ -321,12 +327,14 @@ def load_pancan_master_data(
         sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
         sub_cdr.index = valid_samples
 
-        if "PFI" in sub_cdr.columns and sub_cdr["PFI"].notna().sum() > 0:
-            event_series = sub_cdr["PFI"].fillna(0).astype(int)
-            time_series  = sub_cdr["PFI.time"].fillna(0).astype(float)
-        else:
-            event_series = sub_cdr["OS"].fillna(0).astype(int)
-            time_series  = sub_cdr["OS.time"].fillna(0).astype(float)
+        event_col = f"{endpoint}"
+        time_col = f"{endpoint}.time"
+        if event_col not in sub_cdr.columns or time_col not in sub_cdr.columns:
+            log.warning("Endpoint '%s' columns not found in TCGA-CDR. Silent fallback is prohibited.", endpoint)
+            return None
+
+        event_series = pd.to_numeric(sub_cdr[event_col], errors="coerce").fillna(0).astype(int)
+        time_series  = pd.to_numeric(sub_cdr[time_col], errors="coerce").fillna(0).astype(float)
 
         is_high_risk = (event_series == 1) & (time_series <= horizon_days)
         is_low_risk  = (time_series >= horizon_days)
@@ -352,12 +360,24 @@ def load_pancan_master_data(
         return None
 
 
-def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+def load_cohort_data(
+    cancer: str,
+    horizon_days: int = RISK_HORIZON_DAYS,
+    endpoint: str = "PFI",
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     Loads RNA-Seq expression and standardized TCGA-CDR clinical outcomes for a cohort.
+    Enforces strict survival endpoint selection (PFI vs OS) without silent fallback.
+    Performs patient-level barcode mapping, deduplication of multiple biospecimens per patient,
+    and rigorous exclusion tracking.
+
     Returns:
       (expression_df, binary_risk_labels, time_series, event_series)
     """
+    endpoint = endpoint.strip().upper()
+    if endpoint not in ("PFI", "OS"):
+        raise ValueError(f"Invalid survival endpoint '{endpoint}'. Must be 'PFI' or 'OS'.")
+
     cancer = normalize_cancer_code(cancer)
     fname_expr = XENA_FILE.get(cancer, get_xena_tsv_name(cancer))
     path_expr = XENA_DIR / fname_expr
@@ -389,6 +409,9 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     if not tumor_samples:
         tumor_samples = [c for c in df_expr.columns if c not in ("sample", "_PATIENT")]
 
+    total_genomic_samples = len(df_expr.columns)
+    normal_samples_excluded = total_genomic_samples - len(tumor_samples)
+
     # Restrict to samples present in TCGA-CDR and without redaction flags
     # Map exact barcode (15-char), vial barcode (16-char), or patient barcode (12-char)
     cdr_sample_set = set(df_cdr.index)
@@ -401,25 +424,95 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
         elif s[:12] in cdr_sample_set:
             sample_to_cdr[s] = s[:12]
 
-    valid_samples = [
-        s for s in tumor_samples
-        if s in sample_to_cdr and pd.isna(df_cdr.loc[sample_to_cdr[s], "Redaction"])
-    ]
+    missing_cdr_excluded = len(tumor_samples) - len(sample_to_cdr)
+    redacted_excluded = 0
+    valid_samples_temp = []
+    for s in tumor_samples:
+        if s in sample_to_cdr:
+            cdr_key = sample_to_cdr[s]
+            if pd.notna(df_cdr.loc[cdr_key, "Redaction"]):
+                redacted_excluded += 1
+            else:
+                valid_samples_temp.append(s)
 
-    sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
-    sub_cdr.index = valid_samples
+    # Patient-level grouping and primary tumor prioritization (-01 over -02, etc.)
+    # Group samples by 12-char patient ID to prevent duplicate patient biospecimens across splits
+    patient_sample_map: Dict[str, List[str]] = {}
+    for s in valid_samples_temp:
+        pt_id = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
+        patient_sample_map.setdefault(pt_id, []).append(s)
 
-    # Primary survival endpoint: Progression-Free Interval (PFI)
-    # Fallback to Overall Survival (OS) if PFI is absent
-    if "PFI" in sub_cdr.columns and sub_cdr["PFI"].notna().sum() > 0:
-        event_series = sub_cdr["PFI"].fillna(0).astype(int)
-        time_series  = sub_cdr["PFI.time"].fillna(0).astype(float)
-    else:
-        event_series = sub_cdr["OS"].fillna(0).astype(int)
-        time_series  = sub_cdr["OS.time"].fillna(0).astype(float)
+    deduplicated_samples = []
+    duplicate_samples_excluded = 0
+    for pt_id, s_list in patient_sample_map.items():
+        if len(s_list) == 1:
+            deduplicated_samples.append(s_list[0])
+        else:
+            duplicate_samples_excluded += (len(s_list) - 1)
+            # Prioritize primary solid tumor (sample type 01)
+            primary_samples = [s for s in s_list if "-01" in s]
+            if primary_samples:
+                deduplicated_samples.append(sorted(primary_samples)[0])
+            else:
+                deduplicated_samples.append(sorted(s_list)[0])
+
+    sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in deduplicated_samples]].copy()
+    sub_cdr.index = deduplicated_samples
+
+    # Survival endpoint extraction: STRICT PFI vs OS (NO SILENT FALLBACK)
+    if endpoint == "PFI":
+        if "PFI" not in sub_cdr.columns or "PFI.time" not in sub_cdr.columns:
+            raise ValueError(
+                f"Cohort TCGA-{cancer} lacks 'PFI' or 'PFI.time' in TCGA-CDR table. Silent fallback to OS is prohibited."
+            )
+        event_col = "PFI"
+        time_col = "PFI.time"
+    elif endpoint == "OS":
+        if "OS" not in sub_cdr.columns or "OS.time" not in sub_cdr.columns:
+            raise ValueError(
+                f"Cohort TCGA-{cancer} lacks 'OS' or 'OS.time' in TCGA-CDR table. Silent fallback to PFI is prohibited."
+            )
+        event_col = "OS"
+        time_col = "OS.time"
+
+    # Exclude patients with missing or non-positive follow-up time
+    valid_endpoint_mask = (
+        sub_cdr[event_col].notna() &
+        sub_cdr[time_col].notna() &
+        (pd.to_numeric(sub_cdr[time_col], errors="coerce") > 0)
+    )
+    missing_followup_excluded = int((~valid_endpoint_mask).sum())
+    final_samples = [s for s in deduplicated_samples if valid_endpoint_mask.loc[s]]
+
+    if len(final_samples) == 0:
+        raise ValueError(
+            f"Cohort TCGA-{cancer} is unevaluable for endpoint '{endpoint}': 0 patients with valid follow-up."
+        )
+
+    event_series = pd.to_numeric(sub_cdr.loc[final_samples, event_col], errors="coerce").fillna(0).astype(int)
+    time_series = pd.to_numeric(sub_cdr.loc[final_samples, time_col], errors="coerce").astype(float)
+
+    n_events = int(event_series.sum())
+    n_total = len(final_samples)
+    censored_count = n_total - n_events
+    censoring_rate = round(float(censored_count / max(n_total, 1)), 4)
+
+    if n_events < 5:
+        log.warning(
+            "Cohort TCGA-%s is unevaluable for endpoint '%s': observed events %d < 5 minimum threshold. "
+            "Silent substitution of alternate endpoints is strictly prohibited.",
+            cancer, endpoint, n_events
+        )
+
+    log.info(
+        "  [COHORT AUDIT - TCGA-%s | %s] Total: %d patients, Events: %d, Censored: %d (%.1f%%). "
+        "Exclusions: Normal=%d, Missing CDR=%d, Redacted=%d, Duplicate biospecimens=%d, Invalid follow-up=%d.",
+        cancer, endpoint, n_total, n_events, censored_count, censoring_rate * 100,
+        normal_samples_excluded, missing_cdr_excluded, redacted_excluded, duplicate_samples_excluded, missing_followup_excluded
+    )
 
     # Define landmark Recurrence Risk based on parameterized horizon
-    # High-Risk (1): Confirmed progression within horizon (PFI == 1 and time <= horizon_days)
+    # High-Risk (1): Confirmed progression within horizon (event == 1 and time <= horizon_days)
     # Low-Risk  (0): Confirmed progression-free for at least horizon_days (time >= horizon_days)
     # Early-Censored: Patients without event censored before horizon (time < horizon_days and event == 0)
     is_high_risk = (event_series == 1) & (time_series <= horizon_days)
@@ -428,12 +521,12 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     # Definitive landmark cohort for binary risk evaluation
     # (Continuous survival concordance evaluates all patients)
     landmark_mask = is_high_risk | is_low_risk
-    eval_samples  = [s for s in valid_samples if landmark_mask.loc[s]]
+    eval_samples  = [s for s in final_samples if landmark_mask.loc[s]]
 
     # If landmark samples are too few, retain all patients using median survival split
     if len(eval_samples) < 15:
         log.warning("Cohort %s has limited %d-day follow-up (%d samples). Using full cohort.", cancer, horizon_days, len(eval_samples))
-        eval_samples = valid_samples
+        eval_samples = final_samples
         y_series = event_series.loc[eval_samples]
     else:
         y_series = pd.Series([1 if is_high_risk.loc[s] else 0 for s in eval_samples], index=eval_samples)
@@ -490,10 +583,11 @@ def extract_unified_cohort(
     cohort_name: str,
     horizon_days: int = RISK_HORIZON_DAYS,
     normalize_batches: bool = False,
-    include_external: bool = False
+    include_external: bool = False,
+    endpoint: str = "PFI",
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Loads and unifies single or pan-organ multi-cancer cohorts.
+    Loads and unifies single or pan-organ multi-cancer cohorts for specified endpoint (PFI or OS).
     NOTE: include_external is strictly False by default to prevent external validation contamination
     (METABRIC and GSE31210 must remain completely isolated as true external hospital test sets).
     """
@@ -506,7 +600,7 @@ def extract_unified_cohort(
     # Priority 1: If training PAN-CANCER-ALL, check for unified PanCanAtlas ComBat master matrix
     loaded_master = False
     if is_global_all:
-        master_data = load_pancan_master_data(horizon_days=horizon_days)
+        master_data = load_pancan_master_data(horizon_days=horizon_days, endpoint=endpoint)
         if master_data is not None:
             X_m, y_m, t_m, e_m = master_data
             X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
@@ -520,16 +614,16 @@ def extract_unified_cohort(
     if not loaded_master:
         cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
         for c in cancer_codes:
-            log.info("  Loading clinical genomics for: TCGA-%s...", c)
+            log.info("  Loading clinical genomics for: TCGA-%s (endpoint: %s)...", c, endpoint)
             try:
-                X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
+                X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days, endpoint=endpoint)
                 X_sub, y_sub, t_sub, e_sub = clean_matrix_axes(X_sub, y_sub, t_sub, e_sub, prefix=f"TCGA_{c}")
                 all_X.append(X_sub)
                 all_y.append(y_sub)
                 all_time.append(t_sub)
                 all_event.append(e_sub)
             except Exception as exc:
-                log.warning("Could not ingest cohort TCGA-%s: %s", c, exc)
+                log.warning("Could not ingest cohort TCGA-%s for endpoint %s: %s", c, endpoint, exc)
 
     # Ingest external independent cohorts ONLY when explicitly requested for joint multi-consortium training
     if include_external:
@@ -673,20 +767,29 @@ def train_strong_risk_model(
     epochs: int = 60,
     seed: int = DEFAULT_RANDOM_SEED,
     normalize_batches: bool = False,
-    include_external: bool = False
+    include_external: bool = False,
+    endpoint: str = "PFI",
 ) -> Dict[str, Any]:
+    endpoint = endpoint.strip().upper()
+    if endpoint not in ("PFI", "OS"):
+        raise ValueError(f"Invalid survival endpoint '{endpoint}'. Must be 'PFI' or 'OS'.")
+
     horizon_years = max(1, round(horizon_days / 365.25))
-    time_horizon_str = f"{horizon_years}-Year Progression & Recurrence Risk"
+    time_horizon_str = f"{horizon_years}-Year Progression & Recurrence Risk ({endpoint})"
 
     log.info("=" * 76)
     log.info(" TRAINING CLINICAL RISK ENGINE (STACKING ENSEMBLE): %s", cohort_name)
-    log.info(" Target: %s (Horizon: %d days | Epochs: %d)", time_horizon_str, horizon_days, epochs)
+    log.info(" Target: %s (Horizon: %d days | Epochs: %d | Endpoint: %s)", time_horizon_str, horizon_days, epochs, endpoint)
     log.info(" Single-Flow Multi-Consortium Optimization (Zero Piecewise Batches)")
     log.info("=" * 76)
 
     # 1. Load Raw Patient Expression and Clinical Outcomes
     X_raw_df, y, times, events = extract_unified_cohort(
-        cohort_name, horizon_days=horizon_days, normalize_batches=normalize_batches, include_external=include_external
+        cohort_name,
+        horizon_days=horizon_days,
+        normalize_batches=normalize_batches,
+        include_external=include_external,
+        endpoint=endpoint,
     )
 
     # 2. Stratified 80/20 Partition
@@ -847,7 +950,7 @@ def train_strong_risk_model(
             "n_low_risk"   : int((y == 0).sum()),
             "n_features"   : len(selected_features),
             "architecture" : "StackingEnsemble(ElasticNet + XGBoost + ExtraTrees)",
-            "endpoint"     : "TCGA-CDR PFI / OS",
+            "endpoint"     : f"TCGA-CDR {endpoint}",
             "ipcw_weighted": True,
             "trained_at"   : datetime.datetime.now().isoformat(),
         }
@@ -864,7 +967,7 @@ def train_strong_risk_model(
         "time_horizon"     : time_horizon_str,
         "horizon_days"     : horizon_days,
         "architecture"     : "StackingEnsemble(ElasticNet + XGBoost + ExtraTrees)",
-        "endpoint"         : "TCGA-CDR PFI (Progression-Free Interval)",
+        "endpoint"         : f"TCGA-CDR {endpoint}",
         "n_samples"        : len(y),
         "n_high_risk"      : int((y == 1).sum()),
         "n_low_risk"       : int((y == 0).sum()),
@@ -886,6 +989,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs for deep neural & iterative estimators")
     parser.add_argument("--horizon", type=int, default=RISK_HORIZON_DAYS, help="Landmark recurrence horizon in days (e.g. 365, 1095, 1825)")
     parser.add_argument("--n-genes", type=int, default=DEFAULT_N_GENES, help="Number of individual genes")
+    parser.add_argument("--endpoint", type=str, default="PFI", choices=["PFI", "OS"], help="Standardized TCGA-CDR survival endpoint: 'PFI' or 'OS'")
     parser.add_argument("--no-batch-norm", action="store_true", help="Disable batch normalization for pan-organ cohorts")
     parser.add_argument("--exclude-external", action="store_true", help="Exclude external independent cohorts from consolidated training")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed")
@@ -905,6 +1009,7 @@ def main():
                 epochs=args.epochs,
                 normalize_batches=not args.no_batch_norm,
                 include_external=not args.exclude_external,
+                endpoint=args.endpoint,
                 seed=args.seed,
             )
         except Exception as e:

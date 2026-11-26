@@ -192,77 +192,122 @@ def compute_harrell_c_index_with_ci(
 # ─── 2. Uno's Inverse Probability of Censoring Weighted C-Index ──────────────
 
 def compute_unos_c_index(
-    times: np.ndarray,
-    events: np.ndarray,
-    scores: np.ndarray,
+    times: Union[pd.Series, np.ndarray, List[float]],
+    events: Union[pd.Series, np.ndarray, List[int]],
+    scores: Union[pd.Series, np.ndarray, List[float]],
     tau: Optional[float] = None,
 ) -> Optional[float]:
     """
-    Computes Uno's C-statistic (Uno et al., Ann Intern Med 2011).
-    Uses Inverse Probability of Censoring Weights (IPCW) to correct for the censoring distribution.
+    Computes Uno's Inverse Probability of Censoring Weighted (IPCW) concordance index
+    (Uno et al., Ann Intern Med 2011; 155:310-315).
 
-    Parameters:
-      times: Observed survival times.
-      events: Binary event status.
-      scores: Predicted risk scores.
-      tau: Truncation time. If None, chosen as the maximum time where G(t) >= 0.05.
+    Mathematical Formulation:
+      Let G_hat(t-) = P(C >= t) be the left-continuous Kaplan-Meier estimator of the
+      censoring distribution, where censoring is treated as the event (Delta_c = 1 - Delta).
+      Truncation time tau is defined as:
+        tau = sup { t : G_hat(t-) >= 0.05 }
+
+      Pairs are evaluated for events occurring at or before tau (Delta_i = 1, X_i <= tau).
+      Each eligible event i is compared to all subjects j surviving longer (X_j > X_i).
+      The IPCW weight is:
+        W_i = 1 / [G_hat(X_i-)]^2
+
+      The concordance estimator is:
+        C_tau = sum_{i: Delta_i=1, X_i <= tau} sum_{j: X_j > X_i} W_i * [ I(S_i > S_j) + 0.5 * I(S_i == S_j) ]
+                ------------------------------------------------------------------------------------------------
+                         sum_{i: Delta_i=1, X_i <= tau} sum_{j: X_j > X_i} W_i
 
     Returns:
-      Uno's C-index as float, or None if unevaluable.
+      Uno's C-index as float in [0, 1], or None if unevaluable (e.g., zero events, no comparable pairs,
+      or denominator <= 0).
     """
-    times = np.asarray(times, dtype=float)
-    events = np.asarray(events, dtype=int)
-    scores = np.asarray(scores, dtype=float)
+    times_arr = np.asarray(times, dtype=float)
+    events_arr = np.asarray(events, dtype=int)
+    scores_arr = np.asarray(scores, dtype=float)
 
-    valid_mask = (times > 0) & (~np.isnan(times)) & (~np.isnan(events)) & (~np.isnan(scores))
-    times = times[valid_mask]
-    events = events[valid_mask]
-    scores = scores[valid_mask]
+    valid_mask = (times_arr > 0) & (~np.isnan(times_arr)) & (~np.isnan(events_arr)) & (~np.isnan(scores_arr))
+    times_clean = times_arr[valid_mask]
+    events_clean = events_arr[valid_mask]
+    scores_clean = scores_arr[valid_mask]
 
-    n = len(times)
-    event_indices = np.where(events == 1)[0]
+    n = len(times_clean)
+    event_indices = np.where(events_clean == 1)[0]
     if len(event_indices) == 0 or n < 2:
         return None
 
-    # Fit Kaplan-Meier estimator for censoring distribution G(t) = P(C > t)
-    censoring_events = 1 - events
-    kmf = KaplanMeierFitter()
-    kmf.fit(times, event_observed=censoring_events)
+    # Step 1: Fit left-continuous Kaplan-Meier estimator of censoring distribution G_hat(t-)
+    # Censoring is treated as the event: d_c = 1 - events
+    censoring = 1 - events_clean
+    unique_times = np.sort(np.unique(times_clean))
 
-    # Determine truncation time tau to prevent weight explosion
+    g_step_times: List[float] = []
+    g_left_values: List[float] = []
+    g_val = 1.0
+
+    for t in unique_times:
+        g_step_times.append(float(t))
+        g_left_values.append(float(g_val))
+
+        c_at_t = np.sum((times_clean == t) & (censoring == 1))
+        n_at_t = np.sum(times_clean >= t)
+        if n_at_t > 0 and c_at_t > 0:
+            g_val *= (1.0 - float(c_at_t) / float(n_at_t))
+
+    g_step_times_arr = np.array(g_step_times)
+    g_left_values_arr = np.array(g_left_values)
+
+    def get_g_left(t_query: float) -> float:
+        if len(g_step_times_arr) == 0 or t_query <= g_step_times_arr[0]:
+            return 1.0
+        idx = np.searchsorted(g_step_times_arr, t_query)
+        if idx >= len(g_left_values_arr):
+            return float(g_val)
+        return float(g_left_values_arr[idx])
+
+    # Step 2: Determine truncation time tau = sup { t : G_hat(t-) >= 0.05 }
+    valid_tau_mask = g_left_values_arr >= 0.05
+    if not np.any(valid_tau_mask):
+        return None
+
+    max_tau_empirical = float(np.max(g_step_times_arr[valid_tau_mask]))
     if tau is None:
-        # Choose 95th percentile of event times, bounded where G(t) >= 0.05
-        max_ev_time = float(np.percentile(times[event_indices], 95))
-        tau = max_ev_time
+        tau_val = max_tau_empirical
+    else:
+        tau_val = min(float(tau), max_tau_empirical)
 
-    def get_g(t_val: float) -> float:
-        val = kmf.predict(t_val)
-        return float(np.clip(val, 0.05, 1.0))
-
+    # Step 3: Compute IPCW concordance on eligible pairs
     numerator = 0.0
     denominator = 0.0
 
     for i in event_indices:
-        t_i = times[i]
-        if t_i > tau:
+        t_i = times_clean[i]
+        if t_i > tau_val:
             continue
-        s_i = scores[i]
-        g_i = get_g(t_i)
-        weight_i = 1.0 / (g_i ** 2)
 
-        valid_j = (times > t_i)
+        g_left_i = get_g_left(t_i)
+        if g_left_i < 0.05 or g_left_i <= 0.0:
+            continue
+
+        weight_i = 1.0 / (g_left_i ** 2)
+
+        # In Uno et al. 2011: comparable patients j have X_j > X_i
+        valid_j = times_clean > t_i
         if not np.any(valid_j):
             continue
 
-        s_j = scores[valid_j]
-        # Concordance: risk score i > risk score j (since patient i experienced event earlier)
-        concordant_ij = (s_i > s_j).astype(float) + 0.5 * (s_i == s_j).astype(float)
+        s_i = scores_clean[i]
+        s_j = scores_clean[valid_j]
 
-        numerator += float(np.sum(concordant_ij)) * weight_i
-        denominator += float(len(s_j)) * weight_i
+        # Higher score = higher risk = shorter predicted survival
+        concordant = float(np.sum(s_i > s_j)) + 0.5 * float(np.sum(s_i == s_j))
+        n_pairs_i = float(len(s_j))
 
-    if denominator <= 0:
+        numerator += concordant * weight_i
+        denominator += n_pairs_i * weight_i
+
+    if denominator <= 0.0:
         return None
+
     return round(float(numerator / denominator), 4)
 
 
@@ -474,17 +519,23 @@ class OrganConditionedRiskAdjuster:
     """
     Fits and freezes organ-specific baseline risk reference distributions during training,
     enabling deterministic single-patient (N=1) clinical inference without transductive batch leakage.
+
+    CLINICAL INTERPRETATION NOTICE:
+    Percentile normalization provides within-organ relative ranking, NOT calibrated absolute clinical risk.
+    Reference distributions must be fit strictly on independent training data or cross-validation training folds.
+    If no independent reference exists for a cohort, organ-conditioned scoring is unavailable (returns None/NaN).
     """
     method: str = "percentile"  # 'percentile' or 'median_center'
-    reference_distributions_: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    reference_distributions_: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     is_fitted_: bool = False
 
     def fit(self, df: pd.DataFrame, cohort_col: str = "cohort", score_col: str = "risk_score") -> OrganConditionedRiskAdjuster:
-        """Computes and freezes quantiles, median, and IQR for each organ cohort."""
+        """Computes and freezes quantiles, median, and IQR for each organ cohort strictly from training data."""
         self.reference_distributions_ = {}
         for cohort, grp in df.groupby(cohort_col):
             vals = grp[score_col].dropna().values.astype(float)
-            if len(vals) == 0:
+            if len(vals) < 3:
+                logger.warning("Cohort '%s' has fewer than 3 training samples; skipping reference fitting.", cohort)
                 continue
             quantiles = {f"q_{int(p)}": float(np.percentile(vals, p)) for p in range(5, 100, 5)}
             median_val = float(np.median(vals))
@@ -492,6 +543,7 @@ class OrganConditionedRiskAdjuster:
             q75 = float(np.percentile(vals, 75))
             iqr_val = max(q75 - q25, 1e-5)
             self.reference_distributions_[str(cohort)] = {
+                "n_training_samples": len(vals),
                 "median": median_val,
                 "iqr": iqr_val,
                 "min": float(np.min(vals)),
@@ -501,12 +553,17 @@ class OrganConditionedRiskAdjuster:
         self.is_fitted_ = True
         return self
 
-    def transform_single(self, score: float, cohort: str) -> float:
-        """Transforms a single patient's raw score conditioned on their organ's frozen reference."""
+    def transform_single(self, score: float, cohort: str) -> Optional[float]:
+        """
+        Transforms a single patient's raw score conditioned strictly on their organ's frozen reference.
+        Returns None if no independent reference distribution exists for the cohort.
+        """
+        if not self.is_fitted_:
+            raise ValueError("OrganConditionedRiskAdjuster must be fitted on training data before transform.")
         cohort = str(cohort)
         if cohort not in self.reference_distributions_:
-            # Unknown cohort fallback: return raw score clipped [0, 1]
-            return float(np.clip(score, 0.0, 1.0))
+            # Unknown cohort with no independent reference: mark unavailable
+            return None
 
         dist = self.reference_distributions_[cohort]
         if self.method == "median_center":
@@ -520,14 +577,19 @@ class OrganConditionedRiskAdjuster:
             return float(pct)
 
     def transform(self, df: pd.DataFrame, cohort_col: str = "cohort", score_col: str = "risk_score") -> np.ndarray:
-        """Applies frozen reference transformation to an evaluation DataFrame."""
+        """
+        Applies frozen reference transformation to an evaluation DataFrame.
+        Missing / unreferenced cohorts receive np.nan.
+        """
         if not self.is_fitted_:
             raise ValueError("OrganConditionedRiskAdjuster must be fitted on training data before transform.")
-        adjusted = np.zeros(len(df), dtype=float)
+        adjusted = np.full(len(df), np.nan, dtype=float)
         for i, (_, row) in enumerate(df.iterrows()):
             c = row[cohort_col]
             s = row[score_col]
-            adjusted[i] = self.transform_single(s, c)
+            val = self.transform_single(s, c)
+            if val is not None:
+                adjusted[i] = val
         return adjusted
 
 

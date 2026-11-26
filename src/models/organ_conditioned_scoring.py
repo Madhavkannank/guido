@@ -172,15 +172,21 @@ class DeployableOrganScorer:
                     f"Unknown organ '{organ_cohort}'. Evaluated against frozen Pan-Cancer Global reference."
                 )
             else:
-                # Emergency fallback if no global reference fitted
+                # Mark as unavailable rather than fabricating in-sample reference or leaking
                 return {
                     "raw_score": raw_score,
                     "organ_cohort": organ_cohort,
-                    "organ_conditioned_score": float(np.clip(raw_score, 0.0, 1.0)),
-                    "organ_percentile": float(np.clip(raw_score * 100.0, 0.0, 100.0)),
+                    "organ_conditioned_score": None,
+                    "organ_percentile": None,
                     "is_fallback": True,
-                    "fallback_reason": f"Unknown organ '{organ_cohort}' and no global reference available.",
-                    "reference_used": "NONE_IDENTITY_FALLBACK",
+                    "status": "unavailable_no_independent_reference",
+                    "fallback_reason": f"Unknown organ '{organ_cohort}' and no independent reference distribution available.",
+                    "reference_used": None,
+                    "reference_n_samples": 0,
+                    "clinical_interpretation_notice": (
+                        "Percentile normalization provides within-organ relative ranking, NOT calibrated absolute clinical risk. "
+                        "When no independent reference distribution exists, organ conditioning is unavailable."
+                    ),
                 }
 
         # Compute conditioned score based on configured method
@@ -200,6 +206,11 @@ class DeployableOrganScorer:
             "fallback_reason": fallback_reason,
             "reference_used": matched_ref.organ_cohort,
             "reference_n_samples": matched_ref.n_training_samples,
+            "clinical_interpretation_notice": (
+                "Percentile normalization provides within-organ relative ranking, NOT calibrated absolute clinical risk. "
+                "Patients are evaluated strictly against frozen training reference quantiles; individual evaluations do "
+                "not alter cohort statistics."
+            ),
         }
 
     def score_batch(
