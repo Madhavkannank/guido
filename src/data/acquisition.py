@@ -226,12 +226,25 @@ def filter_low_variance(expr: pd.DataFrame, threshold: float, n_top: int) -> Tup
     return filtered, top_genes
 
 
-def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str = "vital_status") -> Tuple[pd.DataFrame, pd.Series]:
+def align_and_label(
+    expr: pd.DataFrame,
+    clinical: pd.DataFrame,
+    label_col: str = "vital_status",
+    event_mapping: Optional[Dict[str, int]] = None,
+) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Align expression (genes × patients) with clinical labels.
+
+    Args:
+        expr: (n_genes × n_patients) DataFrame
+        clinical: DataFrame indexed by patient ID
+        label_col: Name of clinical outcome column
+        event_mapping: Optional explicit mapping dictionary from categorical
+            values to binary event indicator ({category: 0 or 1}).
+
     Returns:
         X : (n_samples × n_genes) DataFrame
-        y : binary Series (1 = Dead, 0 = Alive)
+        y : binary Series (1 = Event, 0 = Event-Free)
     """
     common_patients = expr.columns.intersection(clinical.index)
     if len(common_patients) == 0:
@@ -252,8 +265,35 @@ def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str =
         X = X.loc[valid_event_mask]
         y_raw = y_raw.loc[valid_event_mask]
 
-    # Standardize oncology event coding (1 = Dead / Event, 0 = Alive / Event-Free)
-    if pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == "object":
+    # Map clinical outcome to binary indicator (1 = Event, 0 = Event-Free)
+    if event_mapping is not None:
+        if not isinstance(event_mapping, dict):
+            raise TypeError(f"event_mapping must be a dict, got {type(event_mapping).__name__}")
+        invalid_targets = [v for v in event_mapping.values() if v not in (0, 1)]
+        if invalid_targets:
+            raise ValueError(
+                f"Explicit event_mapping values must be binary in {{0, 1}}, got invalid values: {invalid_targets}"
+            )
+        norm_mapping = {str(k).strip().lower(): int(v) for k, v in event_mapping.items()}
+        y_lower = y_raw.astype(str).str.strip().str.lower()
+        mapped = y_lower.map(norm_mapping)
+        valid_mask = mapped.notna()
+        if not valid_mask.any():
+            unique_vals = sorted(list(y_lower.dropna().unique()))
+            raise ValueError(
+                f"None of the categories ({unique_vals}) in '{label_col}' matched the provided explicit event_mapping ({event_mapping})."
+            )
+        if not valid_mask.all():
+            n_unmapped = int((~valid_mask).sum())
+            unmapped_vals = sorted(list(y_lower.loc[~valid_mask].unique()))
+            logger.warning(
+                "Excluding %d sample(s) with categories (%s) not in explicit event_mapping.",
+                n_unmapped, unmapped_vals
+            )
+            X = X.loc[valid_mask]
+            mapped = mapped.loc[valid_mask]
+        y = mapped.astype(int)
+    elif pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == "object":
         y_lower = y_raw.astype(str).str.strip().str.lower()
         event_markers = {"dead", "deceased", "recurred", "relapsed", "progressed", "event", "yes", "true", "1", "1.0"}
         free_markers  = {"alive", "disease free", "progression free", "no event", "censored", "no", "false", "0", "0.0"}
@@ -278,22 +318,21 @@ def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str =
 
             y = is_event.astype(int)
         else:
-            unique_vals = y_lower.dropna().unique()
+            unique_vals = sorted(list(y_lower.dropna().unique()))
             unknown_markers = {
                 "unknown", "not reported", "[not reported]", "not available", "[not available]",
                 "indeterminate", "equivocal", "discrepancy", "nan", "null", "none", "unresolved"
             }
             if any(val in unknown_markers for val in unique_vals):
                 raise ValueError(
-                    f"Phenotype column '{label_col}' contains invalid/unknown categories ({list(unique_vals)}). "
+                    f"Phenotype column '{label_col}' contains invalid/unknown categories ({unique_vals}). "
                     "Conversion of unknown phenotypes to event-free (0) is strictly prohibited."
                 )
-            if len(unique_vals) == 2:
-                val_counts = y_lower.value_counts()
-                event_val = val_counts.index[-1]
-                y = (y_lower == event_val).astype(int)
-            else:
-                raise ValueError(f"Unable to resolve binary event mapping for column '{label_col}'. Values: {unique_vals}")
+            raise ValueError(
+                f"Phenotype column '{label_col}' contains unmapped or ambiguous categorical values ({unique_vals}). "
+                "Explicit, verified event/free mappings are required for categorical clinical outcomes; "
+                "automatic or heuristic binary fallback mapping is strictly prohibited."
+            )
     else:
         y_num = pd.to_numeric(y_raw, errors="coerce")
         valid_num_mask = y_num.notna() & y_num.isin([0, 1])

@@ -1277,3 +1277,61 @@ def test_adversarial_unknown_phenotype_category_rejection_no_silent_zero():
         xena_align(expr_unk, clinical_unk)
 
 
+def test_adversarial_ambiguous_binary_categories_rejection_no_automatic_minority_fallback():
+    """
+    Adversarial Check R: Elimination of Heuristic Automatic Binary Outcome Mapping.
+    In retrospective clinical studies, assigning binary clinical outcomes by guessing that
+    the minority category is an adverse event (e.g. death or recurrence) introduces severe
+    classification inversions whenever events exceed 50% or when the column reflects non-survival
+    phenotypes (treatment arms, genotypes, histology).
+    Verifies:
+      1. Ambiguous binary categories (e.g. 'arm a' / 'arm b', 'mutant' / 'wildtype', 'low' / 'high')
+         raise explicit ValueError in both acquisition loaders when unmapped.
+      2. Neither loader heuristically assigns the minority class as the event.
+      3. An explicit, verified event_mapping dict maps outcomes unambiguously.
+    """
+    from src.data.acquisition import align_and_label as acq_align
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    genes = [f"GENE_{i}" for i in range(10)]
+    # Cohort with 65 'Wildtype' and 35 'Mutant' samples
+    samples = [f"PT_{i:03d}" for i in range(100)]
+    expr = pd.DataFrame(np.random.normal(0, 1, (10, 100)), index=genes, columns=samples)
+
+    clinical_ambiguous = pd.DataFrame({
+        "clinical_feature": ["Wildtype"] * 65 + ["Mutant"] * 35,
+    }, index=samples)
+
+    # 1. Prohibit automatic minority class fallback without explicit mapping
+    with pytest.raises(ValueError, match="automatic or heuristic binary fallback mapping is strictly prohibited"):
+        acq_align(expr, clinical_ambiguous, label_col="clinical_feature")
+
+    with pytest.raises(ValueError, match="automatic or heuristic binary fallback mapping is strictly prohibited"):
+        xena_align(expr, clinical_ambiguous, label_col="clinical_feature")
+
+    # 2. Ambiguous treatment arms ('Arm A' vs 'Arm B')
+    clinical_arms = pd.DataFrame({
+        "treatment_arm": ["Arm A"] * 40 + ["Arm B"] * 60,
+    }, index=samples)
+
+    with pytest.raises(ValueError, match="automatic or heuristic binary fallback mapping is strictly prohibited"):
+        acq_align(expr, clinical_arms, label_col="treatment_arm")
+
+    with pytest.raises(ValueError, match="automatic or heuristic binary fallback mapping is strictly prohibited"):
+        xena_align(expr, clinical_arms, label_col="treatment_arm")
+
+    # 3. Explicit verified mapping succeeds without heuristic guessing
+    # If the verified trial protocol specifies Mutant is the adverse outcome (1)
+    verified_mapping = {"Mutant": 1, "Wildtype": 0}
+    X_acq, y_acq = acq_align(expr, clinical_ambiguous, label_col="clinical_feature", event_mapping=verified_mapping)
+    assert len(X_acq) == 100
+    assert y_acq.sum() == 35  # Exactly the 35 mutants are events
+    assert (y_acq.loc[[f"PT_{i:03d}" for i in range(65, 100)]] == 1).all()
+    assert (y_acq.loc[[f"PT_{i:03d}" for i in range(65)]] == 0).all()
+
+    X_xena, y_xena = xena_align(expr, clinical_ambiguous, label_col="clinical_feature", event_mapping=verified_mapping)
+    assert len(X_xena) == 100
+    assert y_xena.sum() == 35
+
+
+

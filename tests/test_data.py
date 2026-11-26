@@ -282,3 +282,78 @@ def test_acquisition_align_and_label_only_unknown_categories_raises_value_error(
     with pytest.raises(ValueError, match="Conversion of unknown phenotypes to event-free \\(0\\) is strictly prohibited"):
         align_and_label(expr, clinical)
 
+
+def test_acquisition_align_and_label_ambiguous_binary_categories_raises_value_error():
+    """
+    Regression Test: Proves that ambiguous binary categories (e.g. 'arm a' vs 'arm b')
+    without verified event/free markers or explicit mapping raise ValueError and NEVER
+    automatically guess the minority class as the event.
+    """
+    gene_ids = [f"ENSG{i:011d}" for i in range(10)]
+    sample_ids = [f"P{i}" for i in range(10)]
+
+    expr = pd.DataFrame(np.random.rand(10, 10), index=gene_ids, columns=sample_ids)
+    # 7 samples "arm a", 3 samples "arm b" (minority class)
+    clinical = pd.DataFrame({
+        "treatment_arm": ["arm a"] * 7 + ["arm b"] * 3,
+    }, index=sample_ids)
+
+    with pytest.raises(ValueError, match="automatic or heuristic binary fallback mapping is strictly prohibited"):
+        align_and_label(expr, clinical, label_col="treatment_arm")
+
+
+def test_xena_align_and_label_ambiguous_binary_categories_raises_value_error():
+    """
+    Regression Test for src.data.xena_acquisition.align_and_label:
+    Verifies that ambiguous binary categories raise ValueError instead of heuristic guessing.
+    """
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    gene_ids = [f"G_{i}" for i in range(10)]
+    sample_ids = [f"S{i}" for i in range(8)]
+
+    expr = pd.DataFrame(np.random.rand(10, 8), index=gene_ids, columns=sample_ids)
+    pheno = pd.DataFrame({
+        "mutation_status": ["mutant"] * 3 + ["wildtype"] * 5,
+    }, index=sample_ids)
+
+    with pytest.raises(ValueError, match="automatic or heuristic binary fallback mapping is strictly prohibited"):
+        xena_align(expr, pheno, label_col="mutation_status")
+
+
+def test_align_and_label_explicit_event_mapping_succeeds():
+    """
+    Regression Test: Verifies that when an explicit, verified event_mapping dictionary
+    is provided, categorical clinical outcomes are mapped unambiguously.
+    """
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    gene_ids = [f"ENSG{i:011d}" for i in range(10)]
+    sample_ids = ["P1", "P2", "P3", "P4"]
+
+    expr = pd.DataFrame(np.random.rand(10, 4), index=gene_ids, columns=sample_ids)
+    clinical = pd.DataFrame({
+        "cohort_status": ["responder", "non-responder", "responder", "non-responder"],
+    }, index=sample_ids)
+
+    explicit_map = {"non-responder": 1, "responder": 0}
+
+    # 1. acquisition align_and_label
+    X, y = align_and_label(expr, clinical, label_col="cohort_status", event_mapping=explicit_map)
+    assert len(X) == 4
+    assert y.loc["P1"] == 0
+    assert y.loc["P2"] == 1
+    assert y.loc["P3"] == 0
+    assert y.loc["P4"] == 1
+
+    # 2. xena align_and_label
+    X_x, y_x = xena_align(expr, clinical, label_col="cohort_status", event_mapping=explicit_map)
+    assert len(X_x) == 4
+    assert y_x.loc["P2"] == 1
+    assert y_x.loc["P1"] == 0
+
+    # 3. Invalid non-binary targets in event_mapping raise ValueError
+    with pytest.raises(ValueError, match="Explicit event_mapping values must be binary"):
+        align_and_label(expr, clinical, label_col="cohort_status", event_mapping={"responder": 2, "non-responder": 0})
+
+
