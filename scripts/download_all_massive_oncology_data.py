@@ -161,7 +161,7 @@ def stream_download(
     Uses chunked streaming to avoid high RAM consumption on multi-gigabyte files.
     """
     if dest_file.exists() and dest_file.stat().st_size >= min_size:
-        log.info("[EXISTS] %s (%,d bytes)", dest_file.name, dest_file.stat().st_size)
+        log.info("[EXISTS] %s (%d bytes)", dest_file.name, dest_file.stat().st_size)
         return True
 
     log.info("Downloading %s -> %s ...", url, dest_file.name)
@@ -233,7 +233,7 @@ def stream_download(
             if dest_file.exists():
                 dest_file.unlink()
             tmp_dest.rename(dest_file)
-            log.info("[SAVED] %s (%,d bytes)", dest_file.name, dest_file.stat().st_size)
+            log.info("[SAVED] %s (%d bytes)", dest_file.name, dest_file.stat().st_size)
             return True
 
         except urllib.error.HTTPError as h_err:
@@ -286,7 +286,7 @@ def download_tcga_all_33(raw_xena: Path, shards: Path) -> int:
                     log.info("Converting %s -> %s (Snappy Parquet)...", tsv_name, pq_name)
                     df = pd.read_csv(dest_tsv, sep="\t", index_col=0, low_memory=False)
                     df.to_parquet(dest_pq, compression="snappy")
-                    log.info("[PARQUET SHARD READY] %s (%,d bytes)", pq_name, dest_pq.stat().st_size)
+                    log.info("[PARQUET SHARD READY] %s (%d bytes)", pq_name, dest_pq.stat().st_size)
                 except Exception as e:
                     log.warning("Parquet conversion failed for %s: %s", cancer, e)
 
@@ -308,7 +308,7 @@ def download_pancan_master_matrix(raw_xena: Path, shards: Path) -> bool:
     dest_pq = shards / pq_name
 
     if dest_pq.exists() and dest_pq.stat().st_size > 100_000_000:
-        log.info("[EXISTS] Unified PanCanAtlas Parquet Shard (%,d bytes)", dest_pq.stat().st_size)
+        log.info("[EXISTS] Unified PanCanAtlas Parquet Shard (%d bytes)", dest_pq.stat().st_size)
         return True
 
     ok = stream_download(TCGA_PANCAN_MASTER_URL, dest_tsv, is_gz=True, min_size=50_000_000)
@@ -317,7 +317,7 @@ def download_pancan_master_matrix(raw_xena: Path, shards: Path) -> bool:
             log.info("Converting %s -> %s (Snappy Parquet)...", tsv_name, pq_name)
             df = pd.read_csv(dest_tsv, sep="\t", index_col=0, low_memory=False)
             df.to_parquet(dest_pq, compression="snappy")
-            log.info("[PARQUET READY] %s (%,d genes x %,d patients)", dest_pq.name, df.shape[0], df.shape[1])
+            log.info("[PARQUET READY] %s (%d genes x %d patients)", dest_pq.name, df.shape[0], df.shape[1])
         except Exception as e:
             log.warning("PanCanAtlas master Parquet conversion note: %s", e)
     return ok
@@ -341,7 +341,7 @@ def download_tcga_methylation_450k(raw_xena: Path, shards: Path, cohorts: Option
         dest_pq = shards / f"TCGA_{cancer}_methylation.parquet"
 
         if dest_pq.exists() and dest_pq.stat().st_size > 10_000_000:
-            log.info("[EXISTS] %s Parquet Shard (%,d bytes)", dest_pq.name, dest_pq.stat().st_size)
+            log.info("[EXISTS] %s Parquet Shard (%d bytes)", dest_pq.name, dest_pq.stat().st_size)
             success += 1
             continue
 
@@ -355,7 +355,7 @@ def download_tcga_methylation_450k(raw_xena: Path, shards: Path, cohorts: Option
                     log.info("Converting %s -> %s (Snappy Parquet)...", tsv_name, dest_pq.name)
                     df = pd.read_csv(dest_tsv, sep="\t", index_col=0, low_memory=False)
                     df.to_parquet(dest_pq, compression="snappy")
-                    log.info("[METHYLATION SHARD READY] %s (%,d probes x %,d patients)", dest_pq.name, df.shape[0], df.shape[1])
+                    log.info("[METHYLATION SHARD READY] %s (%d probes x %d patients)", dest_pq.name, df.shape[0], df.shape[1])
                 except Exception as e:
                     log.warning("Methylation Parquet conversion note for %s: %s", cancer, e)
 
@@ -380,7 +380,7 @@ def download_gtex_v8_baseline(raw_gtex: Path, shards: Path) -> bool:
     dest_pq = shards / pq_name
 
     if dest_pq.exists() and dest_pq.stat().st_size > 500_000_000:
-        log.info("[EXISTS] GTEx v8 Parquet Shard (%,d bytes)", dest_pq.stat().st_size)
+        log.info("[EXISTS] GTEx v8 Parquet Shard (%d bytes)", dest_pq.stat().st_size)
         return True
 
     ok = stream_download(GTEX_V8_TPM_URL, dest_gct, is_gz=True, min_size=500_000_000)
@@ -392,7 +392,7 @@ def download_gtex_v8_baseline(raw_gtex: Path, shards: Path) -> bool:
             if "Description" in df.columns:
                 df = df.drop(columns=["Description"])
             df.to_parquet(dest_pq, compression="snappy")
-            log.info("[GTEx PARQUET READY] %s (%,d genes x %,d healthy samples)", dest_pq.name, df.shape[0], df.shape[1])
+            log.info("[GTEx PARQUET READY] %s (%d genes x %d healthy samples)", dest_pq.name, df.shape[0], df.shape[1])
         except Exception as e:
             log.warning("GTEx Parquet conversion note: %s", e)
     return ok
@@ -407,7 +407,7 @@ def download_metabric(external: Path) -> bool:
     log.info("=" * 76)
     pq_file = external / "metabric_harmonized.parquet"
     if pq_file.exists() and pq_file.stat().st_size > 1_000_000:
-        log.info("[EXISTS] METABRIC harmonized cohort (%,d bytes)", pq_file.stat().st_size)
+        log.info("[EXISTS] METABRIC harmonized cohort (%d bytes)", pq_file.stat().st_size)
         return True
 
     try:
@@ -463,7 +463,7 @@ def download_metabric(external: Path) -> bool:
         df_cached["_TIME_DAYS"] = time_series
         df_cached["_EVENT"] = event_series
         df_cached.to_parquet(pq_file, compression="snappy")
-        log.info("[SAVED METABRIC] %d patients, %d genes (%,d bytes)", len(common), X_df.shape[1], pq_file.stat().st_size)
+        log.info("[SAVED METABRIC] %d patients, %d genes (%d bytes)", len(common), X_df.shape[1], pq_file.stat().st_size)
         return True
     except Exception as exc:
         log.error("Failed to ingest METABRIC: %s", exc)
@@ -519,7 +519,7 @@ def download_geo_expanded_cohorts(external: Path) -> int:
     for geo_id, description, url, target_n in GEO_BENCHMARKS:
         pq_path = external / f"{geo_id.lower()}_harmonized.parquet"
         if pq_path.exists() and pq_path.stat().st_size > 500_000:
-            log.info("[EXISTS] %s: %s (%,d bytes)", geo_id, description, pq_path.stat().st_size)
+            log.info("[EXISTS] %s: %s (%d bytes)", geo_id, description, pq_path.stat().st_size)
             success += 1
             continue
 
@@ -589,7 +589,7 @@ def download_cptac_and_aml(cptac_dir: Path, external: Path) -> int:
                 if "Hugo_Symbol" in df_aml.columns:
                     df_aml = df_aml.dropna(subset=["Hugo_Symbol"]).drop_duplicates(subset=["Hugo_Symbol"]).set_index("Hugo_Symbol")
                 df_aml.to_parquet(pq_aml, compression="snappy")
-                log.info("[BEAT AML PARQUET SAVED] %s (%,d genes x %,d samples)", pq_aml.name, df_aml.shape[0], df_aml.shape[1])
+                log.info("[BEAT AML PARQUET SAVED] %s (%d genes x %d samples)", pq_aml.name, df_aml.shape[0], df_aml.shape[1])
             except Exception as e:
                 log.debug("Beat AML Parquet note: %s", e)
 
@@ -621,7 +621,7 @@ def download_recount3_cancer_studies(external: Path) -> int:
                     log.info("Converting recount3 %s -> Parquet...", file_name)
                     df = pd.read_csv(dest_gz, sep="\t", compression="gzip", index_col=0, low_memory=False)
                     df.to_parquet(dest_pq, compression="snappy")
-                    log.info("[RECOUNT3 READY] %s (%,d genes x %,d samples)", dest_pq.name, df.shape[0], df.shape[1])
+                    log.info("[RECOUNT3 READY] %s (%d genes x %d samples)", dest_pq.name, df.shape[0], df.shape[1])
                 except Exception as e:
                     log.warning("recount3 Parquet conversion note: %s", e)
 
