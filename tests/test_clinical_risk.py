@@ -271,6 +271,27 @@ def test_api_ui_predict_success_with_trained_model():
     assert "risk_score" in pred
     assert 0.0 <= pred["risk_score"] <= 100.0
     assert pred["time_horizon"] == "3-Year Progression & Recurrence Risk"
+    assert "sample_qc" in pred
+    assert pred["regulatory_classification"] == "Research Use Only (RUO)"
+    assert "clinical_disclaimer" in pred
+
+
+def test_api_ui_predict_qc_rejection_on_severe_degradation():
+    """Verify that incoming patient samples with severe RNA degradation (DV200 < 30%) are rejected."""
+    client = TestClient(app)
+    response = client.post(
+        "/api/ui/predict",
+        data={
+            "project_id": "TCGA-KIRP",
+            "disease_name": "papillary_renal_cell_carcinoma",
+            "json_payload": '{"MKI67": 10.5, "PCNA": 11.2, "VEGFA": 9.8}',
+            "dv200": 18.5,  # Severely degraded FFPE RNA (< 30%)
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json().get("detail", "")
+    assert "Clinical Sample Quality Control Rejection" in detail
+    assert "DV200" in detail
 
 
 def test_clean_matrix_axes_and_multi_cohort_concatenation():

@@ -130,11 +130,15 @@ async def ui_predict(
     disease_name: str = Form("pan_cancer_all"),
     file: UploadFile | None = File(None),
     json_payload: str | None = Form(None),
+    dv200: float | None = Form(None),
+    library_depth: float | None = Form(None),
 ):
-    """Accept a CSV upload or (future) JSON payload, run model prediction on first sample,
-    then run the biomedical audit pipeline and return structured result.
+    """Accept a CSV upload or JSON payload, run clinical sample QC gating,
+    run model prediction on first sample, then run the biomedical audit pipeline
+    and return structured result with RUO regulatory provenance.
     """
     from src.api.pipeline import _load_splits, run_biomedical_audit_pipeline
+    from src.preprocessing.sample_qc import ClinicalSampleQualityGate, QCStatus
     from config.settings import MODELS_DIR, RESULTS_DIR
     import pandas as pd
     import joblib
@@ -228,6 +232,20 @@ async def ui_predict(
             raise HTTPException(status_code=400, detail="Uploaded CSV/JSON is empty")
 
         sample = df.iloc[0:1].copy()
+
+        # Pre-analytical Clinical Quality Control (QC) Gate
+        qc_gate = ClinicalSampleQualityGate()
+        qc_res = qc_gate.evaluate_sample_quality(
+            sample.iloc[0],
+            dv200=dv200,
+            library_depth=library_depth,
+        )
+        if qc_res.status == QCStatus.FAIL:
+            reasons_str = "; ".join(qc_res.rejection_reasons)
+            raise HTTPException(
+                status_code=422,
+                detail=f"Clinical Sample Quality Control Rejection: {reasons_str}"
+            )
 
         # Compute hallmark metagenes if expected by model artifact using training baseline statistics
         if isinstance(model_artifact, dict) and "hallmark_metagenes" in model_artifact:
@@ -348,6 +366,19 @@ async def ui_predict(
             "model": str(model_path.name),
             "task": "Genomic Disease Risk Prediction",
             "time": "0.0s",
+            "sample_qc": {
+                "status": qc_res.status.value,
+                "quality_score": qc_res.quality_score,
+                "dv200": dv200,
+                "zero_fraction": qc_res.zero_fraction,
+                "warnings": qc_res.warnings,
+            },
+            "regulatory_classification": "Research Use Only (RUO)",
+            "clinical_disclaimer": (
+                "GUIDO is an investigational clinical decision-support algorithm intended strictly for "
+                "Research Use Only (RUO). It has not been cleared or approved by the US FDA, CDSCO (India), "
+                "or CE-IVD for primary diagnostic or definitive treatment decision-making."
+            ),
         }
 
         # feature importances (best-effort)

@@ -489,10 +489,14 @@ def clean_matrix_axes(
 def extract_unified_cohort(
     cohort_name: str,
     horizon_days: int = RISK_HORIZON_DAYS,
-    normalize_batches: bool = True,
-    include_external: bool = True
+    normalize_batches: bool = False,
+    include_external: bool = False
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
-    """Loads and unifies single or pan-organ multi-cancer cohorts with optional cross-organ normalization."""
+    """
+    Loads and unifies single or pan-organ multi-cancer cohorts.
+    NOTE: include_external is strictly False by default to prevent external validation contamination
+    (METABRIC and GSE31210 must remain completely isolated as true external hospital test sets).
+    """
     is_global_all = cohort_name.upper() in ("PAN-CANCER-ALL", "ALL", "GLOBAL", "ALL-CONSOLIDATED")
     all_X = []
     all_y = []
@@ -506,10 +510,6 @@ def extract_unified_cohort(
         if master_data is not None:
             X_m, y_m, t_m, e_m = master_data
             X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
-            if normalize_batches and len(X_m) > 1:
-                stds = X_m.std(axis=0)
-                stds[stds < 1e-6] = 1.0
-                X_m = (X_m - X_m.mean(axis=0)) / stds
             all_X.append(X_m)
             all_y.append(y_m)
             all_time.append(t_m)
@@ -524,13 +524,6 @@ def extract_unified_cohort(
             try:
                 X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
                 X_sub, y_sub, t_sub, e_sub = clean_matrix_axes(X_sub, y_sub, t_sub, e_sub, prefix=f"TCGA_{c}")
-
-                # Batch normalization across organ cohorts to eliminate tissue-specific baseline offsets
-                if len(cancer_codes) > 1 and normalize_batches and len(X_sub) > 1:
-                    stds = X_sub.std(axis=0)
-                    stds[stds < 1e-6] = 1.0
-                    X_sub = (X_sub - X_sub.mean(axis=0)) / stds
-
                 all_X.append(X_sub)
                 all_y.append(y_sub)
                 all_time.append(t_sub)
@@ -538,8 +531,8 @@ def extract_unified_cohort(
             except Exception as exc:
                 log.warning("Could not ingest cohort TCGA-%s: %s", c, exc)
 
-    # Ingest external independent cohorts in single-flow if requested
-    if is_global_all or include_external:
+    # Ingest external independent cohorts ONLY when explicitly requested for joint multi-consortium training
+    if include_external:
         ext_dir = ROOT / "data" / "processed" / "external"
         ext_dir.mkdir(parents=True, exist_ok=True)
         mb_file = ext_dir / "metabric_harmonized.parquet"
@@ -679,8 +672,8 @@ def train_strong_risk_model(
     horizon_days: int = RISK_HORIZON_DAYS,
     epochs: int = 60,
     seed: int = DEFAULT_RANDOM_SEED,
-    normalize_batches: bool = True,
-    include_external: bool = True
+    normalize_batches: bool = False,
+    include_external: bool = False
 ) -> Dict[str, Any]:
     horizon_years = max(1, round(horizon_days / 365.25))
     time_horizon_str = f"{horizon_years}-Year Progression & Recurrence Risk"

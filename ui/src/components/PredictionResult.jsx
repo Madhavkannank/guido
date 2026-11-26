@@ -12,6 +12,7 @@ export default function PredictionResult({ prediction }) {
       ? 'Intermediate risk profile. Close periodic surveillance recommended.'
       : 'High disease progression risk. Consideration for intensified adjuvant therapy.'
   )
+  const qc = prediction.sample_qc || null
 
   const tierColors = {
     'Low Risk': { text: '#34d399', bg: 'rgba(52, 211, 153, 0.12)', border: 'rgba(52, 211, 153, 0.35)' },
@@ -23,6 +24,36 @@ export default function PredictionResult({ prediction }) {
 
   return (
     <div className="risk-scorecard">
+      {/* Top Banner: RUO & Sample QC */}
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3 pb-2 border-b border-[var(--border)]">
+        <div className="flex items-center gap-2">
+          <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider uppercase bg-amber-500/10 text-amber-400 border border-amber-500/30">
+            RESEARCH USE ONLY (RUO)
+          </span>
+          {qc && (
+            <span
+              className={`px-2 py-0.5 rounded text-[10px] font-semibold tracking-wide ${
+                qc.status === 'PASS'
+                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/30'
+              }`}
+            >
+              QC {qc.status} ({qc.quality_score}/100)
+            </span>
+          )}
+        </div>
+        <div className="text-[11px] text-sub font-mono">{prediction.model || 'Risk Model'}</div>
+      </div>
+
+      {/* QC Warning Banner if present */}
+      {qc && qc.warnings && qc.warnings.length > 0 && (
+        <div className="mb-3 p-2 rounded bg-yellow-500/5 border border-yellow-500/20 text-[11px] text-yellow-300">
+          <span className="font-semibold">Pre-analytical Note: </span>
+          {qc.warnings.join(' ')}
+        </div>
+      )}
+
+      {/* Main Scorecard Header */}
       <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
         <div className="flex items-center gap-3">
           <span
@@ -37,14 +68,13 @@ export default function PredictionResult({ prediction }) {
           </span>
           <span className="text-xs text-sub">{horizon}</span>
         </div>
-        <div className="text-xs text-sub font-mono">{prediction.model || 'Risk Model'}</div>
       </div>
 
       <div className="my-3 flex items-baseline gap-2">
         <span className="text-4xl font-extrabold tracking-tight" style={{ color: currentTier.text }}>
           {pct}%
         </span>
-        <span className="text-sm text-sub">Absolute Disease Risk Score</span>
+        <span className="text-sm text-sub">Absolute Genomic Progression Probability</span>
       </div>
 
       {/* Tri-Zone Risk Spectrum Track */}
@@ -80,9 +110,19 @@ export default function PredictionResult({ prediction }) {
         <span className="text-muted">{recommendation}</span>
       </div>
 
-      <div className="mt-3 flex justify-between items-center text-[11px] text-sub">
-        <span>Model latency: {prediction.time || '0.0s'}</span>
-        <span className="text-[10px] opacity-75">Research &amp; Prototype Decision Engine</span>
+      {/* Mandatory RUO Regulatory Limitation Statement */}
+      <div className="mt-3 p-2.5 rounded bg-[rgba(255,255,255,0.02)] border border-[var(--border)] text-[11px] text-[var(--sub)] leading-normal">
+        <p className="font-semibold text-[var(--text)] mb-0.5">⚠️ Regulatory &amp; Clinical Limitation Notice:</p>
+        <p>
+          Investigational Software as a Medical Device (SaMD) for <strong>Research Use Only (RUO)</strong>.
+          Not for use in primary diagnostic or therapeutic decisions. This algorithm does not replace pathologist examination,
+          AJCC TNM staging, or multidisciplinary tumor board evaluation according to standard oncology practice guidelines (NCCN / ESMO).
+        </p>
+      </div>
+
+      <div className="mt-3 pt-2 border-t border-[var(--border)] flex justify-between items-center text-[10px] text-sub font-mono">
+        <span>Provenance: TCGA PanCanAtlas · Organ-Stratified Concordance</span>
+        <span>Latency: {prediction.time || '0.0s'}</span>
       </div>
     </div>
   )
