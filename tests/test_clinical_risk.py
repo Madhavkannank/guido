@@ -31,6 +31,7 @@ from retrain_fixed import (
     compute_c_index,
     compute_ipcw_weights,
     compute_leak_free_hallmarks,
+    load_cohort_methylation,
 )
 from src.api.app import app
 from src.validation.cross_cohort import (
@@ -378,5 +379,38 @@ def test_cross_platform_gene_alias_resolution():
     # Verify values transferred from legacy columns
     np.testing.assert_allclose(aligned["NUF2"].values, X_legacy["CDCA1"].values, rtol=1e-5)
     np.testing.assert_allclose(aligned["CEP55"].values, X_legacy["C10orf3"].values, rtol=1e-5)
+
+
+def test_load_cohort_methylation_barcode_alignment(tmp_path, monkeypatch):
+    """Verify that multi-omics methylation matrices align patient barcodes to 12-char IDs and prefix probes with METH_."""
+    shards_dir = tmp_path / "data" / "processed" / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    pq_path = shards_dir / "TCGA_KICH_methylation.parquet"
+
+    patients = [f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+    meth_barcodes = [f"{pt}-01" for pt in patients]
+    probes = [f"cg{i:08d}" for i in range(1, 25)]
+
+    rng = np.random.default_rng(42)
+    data = rng.uniform(0.1, 0.9, size=(len(probes), len(meth_barcodes)))
+    data[0, :] = np.linspace(0.01, 0.99, len(meth_barcodes))  # highest variance
+
+    df_meth = pd.DataFrame(data, index=probes, columns=meth_barcodes)
+    df_meth.to_parquet(pq_path)
+
+    import retrain_fixed
+    monkeypatch.setattr(retrain_fixed, "ROOT", tmp_path)
+
+    target_samples = [f"TCGA-KL-{i:04d}-01" if i % 2 == 0 else f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+
+    df_aligned = load_cohort_methylation("KICH", target_samples=target_samples, max_probes=5)
+
+    assert df_aligned is not None
+    assert df_aligned.shape == (len(target_samples), 5)
+    assert all(c.startswith("METH_") for c in df_aligned.columns)
+    assert df_aligned.columns[0] == "METH_cg00000001"
+    assert list(df_aligned.index) == target_samples
+    assert not df_aligned.isna().any().any()
+
 
 

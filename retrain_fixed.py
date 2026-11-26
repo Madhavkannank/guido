@@ -622,6 +622,84 @@ def load_cohort_data(
     return X, y_series, t_eval, e_eval
 
 
+def load_cohort_methylation(
+    cancer: str,
+    target_samples: List[str],
+    max_probes: int = 100,
+) -> Optional[pd.DataFrame]:
+    """
+    Loads TCGA HumanMethylation450 array for a cohort, aligns to target sample barcodes
+    (matching 12-char patient IDs or exact barcodes), selects top-variance CpG probes,
+    and returns an aligned DataFrame of shape (len(target_samples), max_probes) with 'METH_' prefix.
+    """
+    cancer = normalize_cancer_code(cancer)
+    shards_dir = ROOT / "data" / "processed" / "shards"
+    pq_path = shards_dir / f"TCGA_{cancer}_methylation.parquet"
+    tsv_path = XENA_DIR / f"TCGA.{cancer}.sampleMap_HumanMethylation450.tsv"
+
+    if not pq_path.exists() and not tsv_path.exists():
+        return None
+
+    try:
+        log.info("  Loading HumanMethylation450 multi-omics array for TCGA-%s...", cancer)
+        if pq_path.exists():
+            df_meth = pd.read_parquet(pq_path).dropna(how="all").astype(np.float32)
+        else:
+            df_meth = pd.read_csv(tsv_path, sep="\t", index_col=0, low_memory=False).dropna(how="all").astype(np.float32)
+
+        meth_cols = list(df_meth.columns)
+        meth_col_set = set(meth_cols)
+        patient_to_meth_col: Dict[str, str] = {}
+        for c in meth_cols:
+            pt = c[:12] if c.startswith("TCGA-") and len(c) >= 12 else c
+            if pt not in patient_to_meth_col or "-01" in c:
+                patient_to_meth_col[pt] = c
+
+        matched_meth_cols = []
+        for s in target_samples:
+            if s in meth_col_set:
+                matched_meth_cols.append(s)
+            else:
+                pt = s[:12] if s.startswith("TCGA-") and len(c) >= 12 else s
+                if pt in patient_to_meth_col:
+                    matched_meth_cols.append(patient_to_meth_col[pt])
+
+        matched_unique = list(dict.fromkeys(matched_meth_cols))
+        if len(matched_unique) < 10:
+            log.warning("Cohort TCGA-%s has insufficient matched methylation samples (%d < 10).", cancer, len(matched_unique))
+            return None
+
+        df_sub = df_meth[matched_unique]
+        variances = df_sub.var(axis=1)
+        top_probes = variances.nlargest(max_probes).index
+        df_probes = df_sub.loc[top_probes]
+
+        aligned_rows = []
+        for s in target_samples:
+            col = None
+            if s in meth_col_set:
+                col = s
+            else:
+                pt = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
+                col = patient_to_meth_col.get(pt)
+            if col and col in df_probes.columns:
+                aligned_rows.append(df_probes[col].values)
+            else:
+                aligned_rows.append(df_probes.mean(axis=1).values)
+
+        df_aligned = pd.DataFrame(
+            aligned_rows,
+            index=target_samples,
+            columns=[f"METH_{p}" for p in top_probes],
+            dtype=np.float32,
+        )
+        log.info("  [MULTI-OMICS] Aligned %d methylation CpG probes for %d TCGA-%s samples.", df_aligned.shape[1], len(target_samples), cancer)
+        return df_aligned
+    except Exception as exc:
+        log.warning("Could not process methylation for TCGA-%s: %s", cancer, exc)
+        return None
+
+
 def clean_matrix_axes(
     X_mat: pd.DataFrame,
     y_ser: pd.Series,
@@ -665,6 +743,8 @@ def extract_unified_cohort(
     horizon_days: int = RISK_HORIZON_DAYS,
     normalize_batches: bool = False,
     include_external: bool = False,
+    include_methylation: bool = False,
+    max_meth_probes: int = 100,
     endpoint: str = "PFI",
     return_provenance: bool = False,
 ) -> Union[
@@ -673,6 +753,7 @@ def extract_unified_cohort(
 ]:
     """
     Loads and unifies single or pan-organ multi-cancer cohorts for specified endpoint (PFI or OS).
+    Supports multi-omics integration of HumanMethylation450 CpG arrays via include_methylation.
     NOTE: include_external is strictly False by default to prevent external validation contamination
     (METABRIC and GSE31210 must remain completely isolated as true external hospital test sets).
     Tracks explicit data provenance and fallback status.
@@ -683,10 +764,10 @@ def extract_unified_cohort(
     all_time = []
     all_event = []
 
-    # Priority 1: If training PAN-CANCER-ALL, check for unified PanCanAtlas ComBat master matrix
+    # Priority 1: If training PAN-CANCER-ALL without methylation, check for unified PanCanAtlas ComBat master matrix
     loaded_master = False
     master_fallback_reason = None
-    if is_global_all:
+    if is_global_all and not include_methylation:
         try:
             master_data = load_pancan_master_data(horizon_days=horizon_days, endpoint=endpoint)
             if master_data is not None:
@@ -703,18 +784,25 @@ def extract_unified_cohort(
             master_fallback_reason = f"Exception loading master matrix: {str(exc)}"
             log.warning("Master matrix failed: %s", exc)
 
-    # Priority 2: Ingest individual organ cohorts if master matrix not loaded
+    # Priority 2: Ingest individual organ cohorts if master matrix not loaded or multi-omics requested
     if not loaded_master:
         if is_global_all:
-            log.info(
-                "  [PROVENANCE] Fallback to individual cohort aggregation activated (Reason: %s)",
-                master_fallback_reason
-            )
+            if include_methylation:
+                log.info("  [MULTI-OMICS] Activating cohort-by-cohort ingestion for multi-omics epigenetic integration.")
+            else:
+                log.info(
+                    "  [PROVENANCE] Fallback to individual cohort aggregation activated (Reason: %s)",
+                    master_fallback_reason
+                )
         cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
         for c in cancer_codes:
             log.info("  Loading clinical genomics for: TCGA-%s (endpoint: %s)...", c, endpoint)
             try:
                 X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days, endpoint=endpoint)
+                if include_methylation:
+                    df_meth = load_cohort_methylation(c, target_samples=list(X_sub.index), max_probes=max_meth_probes)
+                    if df_meth is not None:
+                        X_sub = pd.concat([X_sub, df_meth], axis=1)
                 X_sub, y_sub, t_sub, e_sub = clean_matrix_axes(X_sub, y_sub, t_sub, e_sub, prefix=f"TCGA_{c}")
                 all_X.append(X_sub)
                 all_y.append(y_sub)
@@ -822,6 +910,7 @@ def extract_unified_cohort(
         "data_provenance": data_provenance,
         "master_matrix_fallback": master_matrix_fallback,
         "master_fallback_reason": master_fallback_reason,
+        "multi_omics": include_methylation,
     }
 
     log.info("  Unified %s Single-Flow Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors) | Provenance: %s",
@@ -888,6 +977,8 @@ def train_strong_risk_model(
     seed: int = DEFAULT_RANDOM_SEED,
     normalize_batches: bool = False,
     include_external: bool = False,
+    include_methylation: bool = False,
+    max_meth_probes: int = 100,
     endpoint: str = "PFI",
 ) -> Dict[str, Any]:
     endpoint = endpoint.strip().upper()
@@ -901,6 +992,8 @@ def train_strong_risk_model(
     log.info(" TRAINING CLINICAL RISK ENGINE (STACKING ENSEMBLE): %s", cohort_name)
     log.info(" Target: %s (Horizon: %d days | Epochs: %d | Endpoint: %s)", time_horizon_str, horizon_days, epochs, endpoint)
     log.info(" Single-Flow Multi-Consortium Optimization (Zero Piecewise Batches)")
+    if include_methylation:
+        log.info(" Multi-Omics Epigenetic Integration: Active (HumanMethylation450 CpG Arrays)")
     log.info("=" * 76)
 
     # 1. Load Raw Patient Expression and Clinical Outcomes
@@ -909,6 +1002,8 @@ def train_strong_risk_model(
         horizon_days=horizon_days,
         normalize_batches=normalize_batches,
         include_external=include_external,
+        include_methylation=include_methylation,
+        max_meth_probes=max_meth_probes,
         endpoint=endpoint,
         return_provenance=True,
     )
@@ -933,7 +1028,7 @@ def train_strong_risk_model(
     X_tr = X_tr_df.values.astype(np.float32)
     X_te = X_te_df.values.astype(np.float32)
 
-    # 4. Feature Selection: Top Individual Genes + Hallmark Metagenes
+    # 4. Feature Selection: Top Individual Genes + Hallmark Metagenes + Multi-Omics Epigenetic Markers
     log.info("  Selecting top %d individual prognostic genes + %d pathway metagenes...", n_indiv_genes, len(meta_names))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", (UserWarning, RuntimeWarning))
@@ -943,14 +1038,23 @@ def train_strong_risk_model(
     # Prioritize genes with universal cross-cohort coverage to prevent cross-platform feature dropout
     nonzero_frac = np.mean(X_tr != 0.0, axis=0)
     meta_indices = [raw_feature_names.index(m) for m in meta_names if m in raw_feature_names]
-    sorted_candidates = [i for i in np.argsort(f_scores)[::-1] if i not in meta_indices]
+    meth_indices = [i for i, name in enumerate(raw_feature_names) if name.startswith("METH_")]
+    sorted_candidates = [i for i in np.argsort(f_scores)[::-1] if i not in meta_indices and i not in meth_indices]
     high_cov_candidates = [i for i in sorted_candidates if nonzero_frac[i] >= 0.65]
     if len(high_cov_candidates) >= n_indiv_genes:
         top_indiv_indices = high_cov_candidates[:n_indiv_genes]
     else:
         top_indiv_indices = sorted_candidates[:n_indiv_genes]
 
-    selected_indices = meta_indices + top_indiv_indices
+    # If multi-omics methylation is present, select top epigenetic CpG probes by F-score
+    selected_meth_indices = []
+    if meth_indices:
+        sorted_meth = sorted(meth_indices, key=lambda idx: f_scores[idx], reverse=True)
+        top_meth_count = min(30, len(sorted_meth))
+        selected_meth_indices = sorted_meth[:top_meth_count]
+        log.info("  [MULTI-OMICS] Retained top %d epigenetic CpG methylation markers by univariate F-score.", len(selected_meth_indices))
+
+    selected_indices = meta_indices + selected_meth_indices + top_indiv_indices
     selected_features = [raw_feature_names[i] for i in selected_indices]
     top_indiv_genes = [raw_feature_names[i] for i in top_indiv_indices]
 
@@ -1101,6 +1205,8 @@ def train_strong_risk_model(
             "data_provenance": provenance["data_provenance"],
             "master_matrix_fallback": provenance["master_matrix_fallback"],
             "master_fallback_reason": provenance["master_fallback_reason"],
+            "multi_omics"  : include_methylation or len(selected_meth_indices) > 0,
+            "methylation_probes_count": len(selected_meth_indices),
             "trained_at"   : datetime.datetime.now().isoformat(),
         }
     }
@@ -1120,6 +1226,8 @@ def train_strong_risk_model(
         "data_provenance"  : provenance["data_provenance"],
         "master_matrix_fallback": provenance["master_matrix_fallback"],
         "master_fallback_reason": provenance["master_fallback_reason"],
+        "multi_omics"      : include_methylation or len(selected_meth_indices) > 0,
+        "methylation_probes_count": len(selected_meth_indices),
         "n_samples"        : len(y),
         "n_high_risk"      : int((y == 1).sum()),
         "n_low_risk"       : int((y == 0).sum()),
@@ -1144,6 +1252,8 @@ def main():
     parser.add_argument("--endpoint", type=str, default="PFI", choices=["PFI", "OS"], help="Standardized TCGA-CDR survival endpoint: 'PFI' or 'OS'")
     parser.add_argument("--no-batch-norm", action="store_true", help="Disable batch normalization for pan-organ cohorts")
     parser.add_argument("--include-external", action="store_true", help="Include external independent cohorts (METABRIC, GSE31210) in training")
+    parser.add_argument("--methylation", action="store_true", help="Enable multi-omics integration: incorporate HumanMethylation450 epigenetic CpG arrays")
+    parser.add_argument("--max-meth-probes", type=int, default=100, help="Maximum number of top-variance methylation CpG probes to extract (default: 100)")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed")
     args = parser.parse_args()
 
@@ -1184,6 +1294,8 @@ def main():
                 epochs=args.epochs,
                 normalize_batches=not args.no_batch_norm,
                 include_external=args.include_external,
+                include_methylation=args.methylation,
+                max_meth_probes=args.max_meth_probes,
                 endpoint=args.endpoint,
                 seed=args.seed,
             )

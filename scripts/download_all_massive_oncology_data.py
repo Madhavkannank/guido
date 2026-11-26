@@ -153,9 +153,11 @@ def stream_download(
     is_gz: bool = False,
     min_size: int = 1000,
     chunk_mb: int = 4,
+    max_retries: int = 3,
 ) -> bool:
     """
-    Streams a large dataset from URL to dest_file with live progress and automatic decompression.
+    Streams a large dataset from URL to dest_file with live progress, automatic decompression,
+    and exponential backoff retry on HTTP 429 / rate limits.
     Uses chunked streaming to avoid high RAM consumption on multi-gigabyte files.
     """
     if dest_file.exists() and dest_file.stat().st_size >= min_size:
@@ -166,78 +168,95 @@ def stream_download(
     tmp_dest = dest_file.parent / f"tmp_{dest_file.name}"
     chunk_size = chunk_mb * 1024 * 1024
 
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            total_size_hdr = resp.headers.get("Content-Length")
-            total_bytes = int(total_size_hdr) if total_size_hdr else None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                total_size_hdr = resp.headers.get("Content-Length")
+                total_bytes = int(total_size_hdr) if total_size_hdr else None
 
-            if is_gz:
-                tmp_gz = dest_file.parent / f"tmp_{dest_file.name}.gz"
-                downloaded = 0
-                t_start = time.time()
-                with open(tmp_gz, "wb") as f_out:
-                    while True:
-                        buf = resp.read(chunk_size)
-                        if not buf:
-                            break
-                        f_out.write(buf)
-                        downloaded += len(buf)
-                        if total_bytes and total_bytes > 50_000_000:
-                            pct = (downloaded / total_bytes) * 100.0
-                            mb = downloaded / (1024 * 1024)
-                            tot_mb = total_bytes / (1024 * 1024)
-                            elapsed = max(0.1, time.time() - t_start)
-                            speed = mb / elapsed
-                            sys.stdout.write(f"\r  Streaming {dest_file.name}: {mb:.1f} / {tot_mb:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
-                            sys.stdout.flush()
+                if is_gz:
+                    tmp_gz = dest_file.parent / f"tmp_{dest_file.name}.gz"
+                    downloaded = 0
+                    t_start = time.time()
+                    with open(tmp_gz, "wb") as f_out:
+                        while True:
+                            buf = resp.read(chunk_size)
+                            if not buf:
+                                break
+                            f_out.write(buf)
+                            downloaded += len(buf)
+                            if total_bytes and total_bytes > 50_000_000:
+                                pct = (downloaded / total_bytes) * 100.0
+                                mb = downloaded / (1024 * 1024)
+                                tot_mb = total_bytes / (1024 * 1024)
+                                elapsed = max(0.1, time.time() - t_start)
+                                speed = mb / elapsed
+                                sys.stdout.write(f"\r  Streaming {dest_file.name}: {mb:.1f} / {tot_mb:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
+                                sys.stdout.flush()
 
-                if total_bytes and total_bytes > 50_000_000:
-                    sys.stdout.write("\n")
+                    if total_bytes and total_bytes > 50_000_000:
+                        sys.stdout.write("\n")
 
-                log.info("Decompressing %s ...", dest_file.name)
-                with gzip.open(tmp_gz, "rb") as f_in, open(tmp_dest, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out, length=chunk_size)
-                if tmp_gz.exists():
-                    tmp_gz.unlink()
+                    log.info("Decompressing %s ...", dest_file.name)
+                    with gzip.open(tmp_gz, "rb") as f_in, open(tmp_dest, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out, length=chunk_size)
+                    if tmp_gz.exists():
+                        tmp_gz.unlink()
+                else:
+                    downloaded = 0
+                    t_start = time.time()
+                    with open(tmp_dest, "wb") as f_out:
+                        while True:
+                            buf = resp.read(chunk_size)
+                            if not buf:
+                                break
+                            f_out.write(buf)
+                            downloaded += len(buf)
+                            if total_bytes and total_bytes > 50_000_000:
+                                pct = (downloaded / total_bytes) * 100.0
+                                mb = downloaded / (1024 * 1024)
+                                tot_mb = total_bytes / (1024 * 1024)
+                                elapsed = max(0.1, time.time() - t_start)
+                                speed = mb / elapsed
+                                sys.stdout.write(f"\r  Streaming {dest_file.name}: {mb:.1f} / {tot_mb:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
+                                sys.stdout.flush()
+                    if total_bytes and total_bytes > 50_000_000:
+                        sys.stdout.write("\n")
+
+            if tmp_dest.stat().st_size < min_size:
+                log.warning("File %s too small (%d bytes), removing.", dest_file.name, tmp_dest.stat().st_size)
+                if tmp_dest.exists():
+                    tmp_dest.unlink()
+                return False
+
+            if dest_file.exists():
+                dest_file.unlink()
+            tmp_dest.rename(dest_file)
+            log.info("[SAVED] %s (%,d bytes)", dest_file.name, dest_file.stat().st_size)
+            return True
+
+        except urllib.error.HTTPError as h_err:
+            if h_err.code == 429 and attempt < max_retries:
+                wait_time = attempt * 5
+                log.warning("HTTP 429 Too Many Requests on %s. Waiting %ds before retry (attempt %d/%d)...",
+                            dest_file.name, wait_time, attempt, max_retries)
+                time.sleep(wait_time)
             else:
-                downloaded = 0
-                t_start = time.time()
-                with open(tmp_dest, "wb") as f_out:
-                    while True:
-                        buf = resp.read(chunk_size)
-                        if not buf:
-                            break
-                        f_out.write(buf)
-                        downloaded += len(buf)
-                        if total_bytes and total_bytes > 50_000_000:
-                            pct = (downloaded / total_bytes) * 100.0
-                            mb = downloaded / (1024 * 1024)
-                            tot_mb = total_bytes / (1024 * 1024)
-                            elapsed = max(0.1, time.time() - t_start)
-                            speed = mb / elapsed
-                            sys.stdout.write(f"\r  Streaming {dest_file.name}: {mb:.1f} / {tot_mb:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
-                            sys.stdout.flush()
-                if total_bytes and total_bytes > 50_000_000:
-                    sys.stdout.write("\n")
+                log.error("HTTP error downloading %s: %s", url, h_err)
+                break
+        except Exception as exc:
+            if attempt < max_retries:
+                wait_time = attempt * 3
+                log.warning("Download error on %s: %s. Retrying in %ds (attempt %d/%d)...",
+                            dest_file.name, exc, wait_time, attempt, max_retries)
+                time.sleep(wait_time)
+            else:
+                log.error("Failed to download %s after %d attempts: %s", url, max_retries, exc)
 
-        if tmp_dest.stat().st_size < min_size:
-            log.warning("File %s too small (%d bytes), removing.", dest_file.name, tmp_dest.stat().st_size)
-            if tmp_dest.exists():
-                tmp_dest.unlink()
-            return False
-
-        if dest_file.exists():
-            dest_file.unlink()
-        tmp_dest.rename(dest_file)
-        log.info("[SAVED] %s (%,d bytes)", dest_file.name, dest_file.stat().st_size)
-        return True
-
-    except Exception as exc:
-        log.error("Failed to download %s: %s", url, exc)
-        if tmp_dest.exists():
-            tmp_dest.unlink()
-        return False
+    if tmp_dest.exists():
+        tmp_dest.unlink()
+    return False
 
 
 # ── SECTION 1: TCGA 33 Cohorts & PanCanAtlas Master ──────────────────────────
@@ -328,6 +347,7 @@ def download_tcga_methylation_450k(raw_xena: Path, shards: Path, cohorts: Option
 
         url = TCGA_METHYL_URL.format(cancer=cancer)
         ok = stream_download(url, dest_tsv, is_gz=True, min_size=10_000_000)
+        time.sleep(1.0)  # Gentle spacing to respect UCSC CDN rate limits
         if ok:
             success += 1
             if not dest_pq.exists():
