@@ -884,7 +884,7 @@ def train_strong_risk_model(
     cohort_name: str,
     n_indiv_genes: int = DEFAULT_N_GENES,
     horizon_days: int = RISK_HORIZON_DAYS,
-    epochs: int = 60,
+    epochs: int = 100,
     seed: int = DEFAULT_RANDOM_SEED,
     normalize_batches: bool = False,
     include_external: bool = False,
@@ -981,17 +981,42 @@ def train_strong_risk_model(
     # 7. Construct Multi-Model Stacking Ensemble with Multi-Epoch Optimization
     xgb_estimators = max(180, epochs * 4)
     elastic_iter = max(4000, epochs * 80)
-    log.info("  Configuring Stacking Ensemble (ElasticNet [%d passes] + XGBoost [%d boosting rounds, scale_pos=%.2f] + ExtraTrees)...",
-             elastic_iter, xgb_estimators, scale_pos_weight)
+    xgb_lr = 0.025 if epochs >= 80 else 0.03
+    xgb_device = "cpu"
+    if TORCH_AVAILABLE:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                xgb_device = "cuda"
+        except Exception:
+            pass
+
+    log.info(
+        "  Configuring Stacking Ensemble (ElasticNet [%d passes] + XGBoost [%d boosting rounds, lr=%.3f, device=%s] + ExtraTrees)...",
+        elastic_iter, xgb_estimators, xgb_lr, xgb_device
+    )
+
+    xgb_kwargs = {
+        "n_estimators": xgb_estimators,
+        "max_depth": 3,
+        "learning_rate": xgb_lr,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "reg_lambda": 4.0,
+        "reg_alpha": 0.5,
+        "scale_pos_weight": scale_pos_weight,
+        "random_state": seed,
+        "verbosity": 0,
+        "tree_method": "hist",
+    }
+    if xgb_device == "cuda":
+        xgb_kwargs["device"] = "cuda"
+
     base_models = [
         ("elasticnet", LogisticRegression(
             penalty="elasticnet", solver="saga", l1_ratio=0.5, C=0.3, max_iter=elastic_iter, random_state=seed
         )),
-        ("xgboost", XGBClassifier(
-            n_estimators=xgb_estimators, max_depth=3, learning_rate=0.03, subsample=0.8,
-            colsample_bytree=0.7, reg_lambda=4.0, reg_alpha=0.5,
-            scale_pos_weight=scale_pos_weight, random_state=seed, verbosity=0
-        )),
+        ("xgboost", XGBClassifier(**xgb_kwargs)),
         ("extratrees", ExtraTreesClassifier(
             n_estimators=150, max_depth=4, min_samples_split=4, bootstrap=True, random_state=seed
         )),
@@ -1112,20 +1137,43 @@ def train_strong_risk_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Omics Disease Risk Engine (StacK-Risk)")
-    parser.add_argument("cohorts", nargs="*", default=["PAN-CANCER-ALL"], help="Cohort names (e.g. PAN-CANCER-ALL PAN-RENAL all)")
-    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs for deep neural & iterative estimators")
+    parser.add_argument("cohorts", nargs="*", default=["PAN-CANCER-ALL"], help="Cohort names (e.g. PAN-CANCER-ALL PAN-RENAL ALL-MODELS)")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs for deep neural & iterative estimators (default: 100)")
     parser.add_argument("--horizon", type=int, default=RISK_HORIZON_DAYS, help="Landmark recurrence horizon in days (e.g. 365, 1095, 1825)")
     parser.add_argument("--n-genes", type=int, default=DEFAULT_N_GENES, help="Number of individual genes")
     parser.add_argument("--endpoint", type=str, default="PFI", choices=["PFI", "OS"], help="Standardized TCGA-CDR survival endpoint: 'PFI' or 'OS'")
     parser.add_argument("--no-batch-norm", action="store_true", help="Disable batch normalization for pan-organ cohorts")
-    parser.add_argument("--exclude-external", action="store_true", help="Exclude external independent cohorts from consolidated training")
+    parser.add_argument("--include-external", action="store_true", help="Include external independent cohorts (METABRIC, GSE31210) in training")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed")
     args = parser.parse_args()
 
-    cohorts = args.cohorts
-    # When user requests 'all', run the consolidated single-flow pan-cancer training across all 33 cohorts + external
-    if "all" in [c.lower() for c in cohorts]:
-        cohorts = ["PAN-CANCER-ALL"]
+    expanded_cohorts = []
+    for c in args.cohorts:
+        c_upper = c.upper()
+        if c_upper in ("ALL-MODELS", "PAN-ALL", "PAN-ALL-MODELS"):
+            expanded_cohorts.extend([
+                "PAN-CANCER-ALL",
+                "PAN-RENAL",
+                "PAN-LUNG",
+                "PAN-GI",
+                "PAN-BREAST",
+                "PAN-GYN",
+                "PAN-UROLOGICAL",
+                "PAN-HEPATOBILIARY",
+                "PAN-BRAIN",
+                "PAN-HEADNECK",
+                "PAN-ENDOCRINE",
+                "PAN-MELANOMA",
+                "PAN-SARCOMA",
+                "PAN-HEMATOLOGIC",
+            ])
+        elif c.lower() == "all":
+            expanded_cohorts.append("PAN-CANCER-ALL")
+        else:
+            expanded_cohorts.append(c_upper)
+
+    seen = set()
+    cohorts = [c for c in expanded_cohorts if not (c in seen or seen.add(c))]
 
     for c in cohorts:
         try:
@@ -1135,7 +1183,7 @@ def main():
                 horizon_days=args.horizon,
                 epochs=args.epochs,
                 normalize_batches=not args.no_batch_norm,
-                include_external=not args.exclude_external,
+                include_external=args.include_external,
                 endpoint=args.endpoint,
                 seed=args.seed,
             )
