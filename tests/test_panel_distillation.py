@@ -21,10 +21,10 @@ from src.models.panel_distillation import (
 
 @pytest.fixture
 def synthetic_expression_cohort():
-    """Generates synthetic expression matrix (150 patients x 120 genes) with true survival targets."""
+    """Generates synthetic expression matrix (100 patients x 50 genes) with true survival targets."""
     np.random.seed(42)
-    n_patients = 150
-    n_genes = 120
+    n_patients = 100
+    n_genes = 50
 
     gene_names = [f"GENE_{i:03d}" for i in range(n_genes)]
     # Mark specific genes with hallmark names
@@ -123,3 +123,37 @@ def test_assay_specifications_export(synthetic_expression_cohort, tmp_path):
     content = json_out.read_text(encoding="utf-8")
     assert "35-Gene" in content or "panel_size" in content
     assert "genes" in content
+    assert "in_silico_candidate" in content
+    assert "missing_evidence" in content
+
+
+def test_insufficient_events_raises_clear_error(synthetic_expression_cohort):
+    """Verifies that distillation raises ValueError on insufficient events instead of silent fallback."""
+    df_X, times, events = synthetic_expression_cohort
+    # Zero events
+    zero_events = np.zeros(len(events), dtype=int)
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3)
+    with pytest.raises(ValueError, match="Insufficient survival data"):
+        distiller.fit(df_X, times, zero_events)
+
+
+def test_synthetic_provenance_flagging(synthetic_expression_cohort, tmp_path):
+    """Verifies that synthetic data is strictly labeled as synthetic in reports and exported specs."""
+    df_X, times, events = synthetic_expression_cohort
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3, random_state=42)
+    report = distiller.fit(
+        df_X, times, events,
+        data_source="synthetic_test",
+        is_synthetic=True,
+        endpoint="test_pfi"
+    )
+
+    assert report.is_synthetic is True
+    assert report.data_source == "synthetic_test"
+    assert any("SYNTHETIC" in lim for lim in report.limitations)
+
+    json_out = tmp_path / "synthetic_spec.json"
+    spec = distiller.export_assay_specifications(panel_size=15, output_path=json_out)
+    assert spec["is_synthetic_training"] is True
+    assert "in-silico research specification" in spec["notice"]
+
