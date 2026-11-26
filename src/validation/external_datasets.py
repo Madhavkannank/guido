@@ -93,7 +93,9 @@ def fetch_metabric(
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     Fetches and harmonizes the METABRIC breast cancer cohort (~1,980 patients).
-    If network is unavailable or download fails, falls back gracefully to synthetic benchmark.
+    Raises RuntimeError if network is unavailable or download fails (no silent synthetic fallback).
+    For offline testing, use generate_synthetic_external_cohort() explicitly.
+
     Returns:
         (expression_df, binary_3yr_risk, times_days, events)
     """
@@ -241,6 +243,7 @@ def fetch_geo_gse31210(
     Fetches and harmonizes NCBI GEO GSE31210 lung adenocarcinoma cohort (226 patients).
     Extracts recurrence endpoints (days before relapse/censor, relapse status) and
     maps Affymetrix HG-U133_Plus_2 probes to official HGNC gene symbols.
+    Raises RuntimeError if network is unavailable or download fails (no silent synthetic fallback).
     """
     out_dir = out_dir or EXTERNAL_DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)

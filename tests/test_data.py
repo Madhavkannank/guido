@@ -123,3 +123,68 @@ def test_split_data_stratified():
     splits_3way = split_data(X, y, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15)
     for name, (Xs, ys) in splits_3way.items():
         assert len(ys.unique()) == 2, f"Split '{name}' is missing a class"
+
+
+# ─── Xena Acquisition Integrity (No Synthetic Labels) ────────────────────────
+
+def test_xena_missing_phenotypes_raises_runtime_error_no_synthetic_labels(monkeypatch):
+    """
+    Regression Test: Proves that missing phenotypes in real Xena acquisition
+    raise RuntimeError and NEVER silently generate synthetic random labels.
+    """
+    import src.data.xena_acquisition as xena_mod
+
+    dummy_expr = pd.DataFrame(
+        np.random.rand(20, 5),
+        index=[f"GENE_{i}" for i in range(20)],
+        columns=[f"TCGA-01-000{i}" for i in range(5)],
+    )
+
+    monkeypatch.setattr(xena_mod, "download_matrix", lambda dataset, hub: dummy_expr)
+    monkeypatch.setattr(xena_mod, "download_phenotypes", lambda dataset, hub: None)
+
+    with pytest.raises(RuntimeError, match="Real-data acquisition strictly prohibits synthetic label generation"):
+        xena_mod.run_xena_acquisition("TCGA.BRCA.sampleMap/HiSeqV2")
+
+
+def test_xena_empty_phenotypes_raises_runtime_error(monkeypatch):
+    """Verifies that empty DataFrame from download_phenotypes raises RuntimeError."""
+    import src.data.xena_acquisition as xena_mod
+
+    dummy_expr = pd.DataFrame(
+        np.random.rand(20, 5),
+        index=[f"GENE_{i}" for i in range(20)],
+        columns=[f"TCGA-01-000{i}" for i in range(5)],
+    )
+
+    monkeypatch.setattr(xena_mod, "download_matrix", lambda dataset, hub: dummy_expr)
+    monkeypatch.setattr(xena_mod, "download_phenotypes", lambda dataset, hub: pd.DataFrame())
+
+    with pytest.raises(RuntimeError, match="Real-data acquisition strictly prohibits synthetic label generation"):
+        xena_mod.run_xena_acquisition("TCGA.BRCA.sampleMap/HiSeqV2")
+
+
+def test_xena_align_and_label_invalid_phenotypes_raises():
+    """Verifies that xena align_and_label raises ValueError on invalid or missing clinical labels."""
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    expr = pd.DataFrame(
+        np.random.rand(10, 4),
+        index=[f"G_{i}" for i in range(10)],
+        columns=["S1", "S2", "S3", "S4"],
+    )
+
+    # 1. No overlapping samples
+    pheno_no_overlap = pd.DataFrame({"PFI": [1, 0, 1]}, index=["X1", "X2", "X3"])
+    with pytest.raises(ValueError, match="No sample IDs overlap"):
+        xena_align(expr, pheno_no_overlap)
+
+    # 2. No valid outcome columns
+    pheno_no_col = pd.DataFrame({"random_col": ["A", "B", "C", "D"]}, index=["S1", "S2", "S3", "S4"])
+    with pytest.raises(ValueError, match="No valid clinical outcome"):
+        xena_align(expr, pheno_no_col)
+
+    # 3. All events NaN / missing
+    pheno_nan = pd.DataFrame({"PFI": [np.nan, np.nan, np.nan, np.nan]}, index=["S1", "S2", "S3", "S4"])
+    with pytest.raises(ValueError, match="No valid binary outcome labels remain"):
+        xena_align(expr, pheno_nan)

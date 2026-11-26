@@ -246,6 +246,11 @@ def align_and_label(
             y_num = y_num.loc[valid_num_mask]
         y = y_num.astype(int)
 
+    if len(y) == 0:
+        raise ValueError(
+            f"No valid binary outcome labels remain for column '{label_col}' after excluding invalid/missing values."
+        )
+
     y.name = "label"
     return X, y
 
@@ -284,10 +289,9 @@ def run_xena_acquisition(
     pheno_dataset = phenotype_dataset or dataset.replace("HiSeqV2", "clinicalMatrix")
     phenotypes = download_phenotypes(pheno_dataset, hub)
     if phenotypes is None or phenotypes.empty:
-        logger.warning("Could not download phenotypes; using synthetic labels")
-        phenotypes = pd.DataFrame(
-            {"label": np.random.randint(0, 2, len(expr_raw.columns))},
-            index=expr_raw.columns
+        raise RuntimeError(
+            f"Failed to acquire phenotype/clinical data for '{pheno_dataset}' from hub '{hub}'. "
+            "Real-data acquisition strictly prohibits synthetic label generation."
         )
     
     # Normalize

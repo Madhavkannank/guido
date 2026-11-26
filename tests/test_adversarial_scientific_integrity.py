@@ -1050,3 +1050,76 @@ def test_adversarial_survival_endpoint_integrity():
     except Exception as e:
         pytest.skip(f"TCGA-KICH data not present: {e}")
 
+
+def test_adversarial_xena_acquisition_no_synthetic_labels(monkeypatch):
+    """
+    Adversarial Check N: Real Xena Ingestion Never Generates Synthetic Labels.
+    Verifies that when phenotype downloading fails or yields empty records,
+    run_xena_acquisition() raises an explicit RuntimeError and never fabricates random labels.
+    """
+    import src.data.xena_acquisition as xena_mod
+
+    dummy_expr = pd.DataFrame(
+        np.random.normal(0, 1, size=(25, 6)),
+        index=[f"GENE_{i}" for i in range(25)],
+        columns=[f"TCGA-01-000{i}" for i in range(6)],
+    )
+
+    monkeypatch.setattr(xena_mod, "download_matrix", lambda dataset, hub: dummy_expr)
+    monkeypatch.setattr(xena_mod, "download_phenotypes", lambda dataset, hub: None)
+
+    with pytest.raises(RuntimeError, match="Real-data acquisition strictly prohibits synthetic label generation"):
+        xena_mod.run_xena_acquisition("TCGA.BRCA.sampleMap/HiSeqV2")
+
+
+def test_adversarial_panel_distillation_input_validation_and_alignment():
+    """
+    Adversarial Check O: Raw Survival Event/Time Validation & Strict Synchronous Alignment.
+    Verifies:
+      1. Mismatched array lengths across df_X, times, events, and patient/sample IDs raise ValueError.
+      2. Raw survival inputs with NaN events, invalid event values (!= 0 or 1), and non-positive times
+         are validated prior to casting and explicitly excluded.
+      3. Strict 1:1 alignment between expression rows, times, events, and patient barcodes is preserved.
+    """
+    np.random.seed(42)
+    n = 35
+    df_X = pd.DataFrame(
+        np.random.normal(0, 1, size=(n, 12)),
+        columns=[f"G_{i}" for i in range(12)],
+        index=[f"TCGA-AL-{i:04d}-01A" for i in range(n)],
+    )
+    times = np.random.uniform(50, 800, size=n)
+    events = np.array([1, 0] * (n // 2) + [1] * (n % 2), dtype=float)
+    patient_ids = [f"TCGA-AL-{i:04d}" for i in range(n)]
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[5], n_folds=3, random_state=42)
+
+    # 1. Length mismatch rejection
+    with pytest.raises(ValueError, match="Array length mismatch"):
+        distiller.fit(df_X, times[:20], events)
+
+    with pytest.raises(ValueError, match="Patient IDs length mismatch"):
+        distiller.fit(df_X, times, events, patient_ids=patient_ids[:20])
+
+    # 2. Inject NaN event, invalid event (2.0), and non-positive time (-10.0)
+    events_corrupted = events.copy()
+    events_corrupted[4] = np.nan
+    events_corrupted[11] = 2.0
+    times_corrupted = times.copy()
+    times_corrupted[18] = -10.0
+
+    report = distiller.fit(
+        df_X=df_X,
+        times=times_corrupted,
+        events=events_corrupted,
+        patient_ids=patient_ids,
+        data_source="adversarial_alignment_test",
+        is_synthetic=True,
+    )
+
+    # 3 corrupted samples excluded -> 32 remain
+    assert report.n_samples == 32
+    assert len(distiller.oof_comparator_scores_) == 32
+    assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
+    assert report.patient_count == 32
+

@@ -226,17 +226,65 @@ class MinimalGenePanelDistiller:
         """
         feature_names = list(df_X.columns)
         n_features = len(feature_names)
-        n_samples = len(df_X)
+        n_samples_orig = len(df_X)
 
+        # ─── Step 0a: Input Sequence and Length Validation ────────────────────
+        try:
+            n_times = len(times)
+        except TypeError:
+            raise ValueError(f"times must be a sequence or array, got {type(times)}")
+        try:
+            n_events = len(events)
+        except TypeError:
+            raise ValueError(f"events must be a sequence or array, got {type(events)}")
+
+        if n_times != n_samples_orig or n_events != n_samples_orig:
+            raise ValueError(
+                f"Array length mismatch: df_X has {n_samples_orig} rows, "
+                f"times has {n_times} elements, and events has {n_events} elements. "
+                "All input arrays must have identical length."
+            )
+
+        if patient_ids is not None and len(patient_ids) != n_samples_orig:
+            raise ValueError(
+                f"Patient IDs length mismatch: df_X has {n_samples_orig} rows, "
+                f"patient_ids has {len(patient_ids)} elements. Patient identifiers must match sample count."
+            )
+
+        if sample_ids is not None and len(sample_ids) != n_samples_orig:
+            raise ValueError(
+                f"Sample IDs length mismatch: df_X has {n_samples_orig} rows, "
+                f"sample_ids has {len(sample_ids)} elements. Sample identifiers must match sample count."
+            )
+
+        # ─── Step 0b: Validate Raw Survival Inputs Prior to Numeric Casting ──
+        raw_times_s = pd.to_numeric(pd.Series(times).reset_index(drop=True), errors="coerce")
+        raw_events_s = pd.to_numeric(pd.Series(events).reset_index(drop=True), errors="coerce")
+
+        # Missing and invalid checks:
+        # Times must be non-NaN and strictly positive (t > 0)
+        # Events must be non-NaN and binary in {0, 1}
+        valid_times = raw_times_s.notna() & (raw_times_s > 0)
+        valid_events = raw_events_s.notna() & raw_events_s.isin([0, 1])
+        valid_mask = (valid_times & valid_events).to_numpy()
+
+        n_invalid = int((~valid_mask).sum())
+        if n_invalid > 0:
+            reasons = []
+            if (~valid_times).any():
+                reasons.append(f"{int((~valid_times).sum())} non-positive/missing times")
+            if (~valid_events).any():
+                reasons.append(f"{int((~valid_events).sum())} invalid/missing events (must be in {{0, 1}})")
+            logger.warning(
+                "Excluding %d invalid or missing sample(s) prior to Cox distillation: %s",
+                n_invalid, "; ".join(reasons)
+            )
+
+        # Synchronously filter df_X, X, times, and events to preserve strict alignment
+        df_X = df_X.iloc[valid_mask].copy()
         X = df_X.values.astype(float)
-        times = np.asarray(times, dtype=float)
-        events = np.asarray(events, dtype=int)
-
-        # Scientific Validation: Check survival constraints
-        valid_mask = (times > 0) & (~np.isnan(times)) & (~np.isnan(events))
-        X = X[valid_mask]
-        times = times[valid_mask]
-        events = events[valid_mask]
+        times = raw_times_s[valid_mask].to_numpy(dtype=float)
+        events = raw_events_s[valid_mask].to_numpy(dtype=int)
         n_samples = len(times)
         n_events = int(np.sum(events == 1))
 
@@ -252,14 +300,15 @@ class MinimalGenePanelDistiller:
             n_samples, n_events, censoring_rate * 100, n_features
         )
 
-        # ─── Step 0: Patient Identification & Cross-Validation Strategy ──────
+        # ─── Step 0c: Patient Identification & Cross-Validation Strategy ──────
         extracted_patients: Optional[np.ndarray] = None
         if patient_ids is not None:
-            extracted_patients = extract_tcga_patient_ids(patient_ids)[valid_mask]
+            raw_pt = np.asarray(extract_tcga_patient_ids(patient_ids))
+            extracted_patients = raw_pt[valid_mask]
         elif sample_ids is not None:
-            extracted = extract_tcga_patient_ids(sample_ids)[valid_mask]
+            raw_sample = np.asarray(extract_tcga_patient_ids(sample_ids))
             if any(str(s).startswith("TCGA-") for s in sample_ids):
-                extracted_patients = extracted
+                extracted_patients = raw_sample[valid_mask]
             else:
                 logger.info(
                     "Sample IDs provided do not contain TCGA patient barcodes; "
@@ -268,7 +317,8 @@ class MinimalGenePanelDistiller:
         elif hasattr(df_X, "index") and len(df_X.index) > 0:
             first_idx = str(df_X.index[0])
             if first_idx.startswith("TCGA-"):
-                extracted_patients = extract_tcga_patient_ids(df_X.index)[valid_mask]
+                # df_X was already filtered by valid_mask, so df_X.index is already aligned
+                extracted_patients = np.asarray(extract_tcga_patient_ids(df_X.index))
                 logger.info(
                     "Auto-extracted TCGA patient barcodes from sample index (N=%d samples -> %d unique patients)",
                     n_samples, len(np.unique(extracted_patients))

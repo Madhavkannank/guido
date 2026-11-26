@@ -157,3 +157,89 @@ def test_synthetic_provenance_flagging(synthetic_expression_cohort, tmp_path):
     assert spec["is_synthetic_training"] is True
     assert "in-silico research specification" in spec["notice"]
 
+
+def test_distiller_mismatched_array_lengths_raises_value_error(synthetic_expression_cohort):
+    """Verifies that distiller.fit() rejects mismatched array lengths across X, times, events, and IDs."""
+    df_X, times, events = synthetic_expression_cohort
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3)
+
+    # 1. times length mismatch
+    with pytest.raises(ValueError, match="Array length mismatch"):
+        distiller.fit(df_X, times[:50], events)
+
+    # 2. events length mismatch
+    with pytest.raises(ValueError, match="Array length mismatch"):
+        distiller.fit(df_X, times, events[:50])
+
+    # 3. patient_ids length mismatch
+    bad_pt_ids = [f"TCGA-AA-{i:04d}" for i in range(len(df_X) - 5)]
+    with pytest.raises(ValueError, match="Patient IDs length mismatch"):
+        distiller.fit(df_X, times, events, patient_ids=bad_pt_ids)
+
+    # 4. sample_ids length mismatch
+    bad_sample_ids = [f"TCGA-AA-{i:04d}-01A" for i in range(len(df_X) - 5)]
+    with pytest.raises(ValueError, match="Sample IDs length mismatch"):
+        distiller.fit(df_X, times, events, sample_ids=bad_sample_ids)
+
+
+def test_distiller_nan_events_handled_with_strict_alignment(synthetic_expression_cohort):
+    """
+    Verifies that raw survival inputs with NaN events are validated prior to integer casting,
+    invalid samples are explicitly excluded, and expression rows, times, events, and patient barcodes
+    remain strictly aligned.
+    """
+    df_X, times, events = synthetic_expression_cohort
+    # Introduce NaN values into float events array
+    events_with_nan = events.astype(float).copy()
+    nan_indices = [5, 12, 25, 40]
+    events_with_nan[nan_indices] = np.nan
+
+    # Provide patient IDs to verify synchronous alignment
+    patient_ids = [f"TCGA-PT-{i:04d}" for i in range(len(df_X))]
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3, random_state=42)
+    report = distiller.fit(
+        df_X=df_X,
+        times=times,
+        events=events_with_nan,
+        patient_ids=patient_ids,
+        data_source="nan_event_test",
+        is_synthetic=True,
+    )
+
+    expected_n = len(df_X) - len(nan_indices)
+    assert report.n_samples == expected_n
+    assert len(distiller.oof_comparator_scores_) == expected_n
+    # Verify that the distiller fitted without premature casting exception
+    assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
+
+
+def test_distiller_invalid_event_values_handled_with_strict_alignment(synthetic_expression_cohort):
+    """
+    Verifies that invalid survival event values (e.g. 2, -1, non-binary) are explicitly handled,
+    excluded from survival distillation, and strict 1:1 alignment is maintained.
+    """
+    df_X, times, events = synthetic_expression_cohort
+    events_with_invalid = events.astype(float).copy()
+    invalid_indices = [3, 17, 33]
+    events_with_invalid[invalid_indices[0]] = 2.0
+    events_with_invalid[invalid_indices[1]] = -1.0
+    events_with_invalid[invalid_indices[2]] = 99.0
+
+    sample_ids = [f"TCGA-SA-{i:04d}-01A" for i in range(len(df_X))]
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3, random_state=42)
+    report = distiller.fit(
+        df_X=df_X,
+        times=times,
+        events=events_with_invalid,
+        sample_ids=sample_ids,
+        data_source="invalid_event_test",
+        is_synthetic=True,
+    )
+
+    expected_n = len(df_X) - len(invalid_indices)
+    assert report.n_samples == expected_n
+    assert len(distiller.oof_comparator_scores_) == expected_n
+    assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
+
