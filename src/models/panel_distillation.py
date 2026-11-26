@@ -262,9 +262,9 @@ class MinimalGenePanelDistiller:
         raw_events_s = pd.to_numeric(pd.Series(events).reset_index(drop=True), errors="coerce")
 
         # Missing and invalid checks:
-        # Times must be non-NaN and strictly positive (t > 0)
+        # Times must be non-NaN, finite (rejecting np.inf / -np.inf), and strictly positive (t > 0)
         # Events must be non-NaN and binary in {0, 1}
-        valid_times = raw_times_s.notna() & (raw_times_s > 0)
+        valid_times = raw_times_s.notna() & np.isfinite(raw_times_s) & (raw_times_s > 0)
         valid_events = raw_events_s.notna() & raw_events_s.isin([0, 1])
         valid_mask = (valid_times & valid_events).to_numpy()
 
@@ -272,12 +272,17 @@ class MinimalGenePanelDistiller:
         if n_invalid > 0:
             reasons = []
             if (~valid_times).any():
-                reasons.append(f"{int((~valid_times).sum())} non-positive/missing times")
+                reasons.append(f"{int((~valid_times).sum())} non-positive/non-finite/missing times")
             if (~valid_events).any():
                 reasons.append(f"{int((~valid_events).sum())} invalid/missing events (must be in {{0, 1}})")
             logger.warning(
                 "Excluding %d invalid or missing sample(s) prior to Cox distillation: %s",
                 n_invalid, "; ".join(reasons)
+            )
+
+        if not np.any(valid_mask):
+            raise ValueError(
+                "No valid survival records remain after excluding non-finite, non-positive, or missing times and events."
             )
 
         # Synchronously filter df_X, X, times, and events to preserve strict alignment

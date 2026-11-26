@@ -188,3 +188,97 @@ def test_xena_align_and_label_invalid_phenotypes_raises():
     pheno_nan = pd.DataFrame({"PFI": [np.nan, np.nan, np.nan, np.nan]}, index=["S1", "S2", "S3", "S4"])
     with pytest.raises(ValueError, match="No valid binary outcome labels remain"):
         xena_align(expr, pheno_nan)
+
+
+def test_xena_align_and_label_unknown_phenotypes_excluded_not_zero():
+    """
+    Regression Test: Prohibits unknown phenotype categories ('unknown', 'not reported', 'discrepancy')
+    from being silently converted to event-free (0). Samples with unknown categories must be excluded.
+    """
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    expr = pd.DataFrame(
+        np.random.rand(10, 5),
+        index=[f"G_{i}" for i in range(10)],
+        columns=["S1", "S2", "S3", "S4", "S5"],
+    )
+    # S1: Dead (event=1), S2: Alive (event=0), S3: Unknown, S4: Not Reported, S5: Discrepancy
+    pheno = pd.DataFrame({
+        "vital_status": ["Dead", "Alive", "Unknown", "Not Reported", "Discrepancy"],
+    }, index=["S1", "S2", "S3", "S4", "S5"])
+
+    X, y = xena_align(expr, pheno)
+
+    # S3, S4, S5 must be excluded, NOT assigned 0!
+    assert len(X) == 2
+    assert list(X.index) == ["S1", "S2"]
+    assert y.loc["S1"] == 1
+    assert y.loc["S2"] == 0
+    assert "S3" not in y.index
+    assert "S4" not in y.index
+    assert "S5" not in y.index
+
+
+def test_xena_align_and_label_only_unknown_categories_raises_value_error():
+    """
+    Regression Test: If a phenotype column contains only unknown or unmapped categories,
+    it must raise an explicit ValueError rather than silently returning an all-zero vector.
+    """
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    expr = pd.DataFrame(
+        np.random.rand(10, 3),
+        index=[f"G_{i}" for i in range(10)],
+        columns=["S1", "S2", "S3"],
+    )
+    pheno = pd.DataFrame({
+        "vital_status": ["unknown", "not reported", "indeterminate"],
+    }, index=["S1", "S2", "S3"])
+
+    with pytest.raises(ValueError, match="Conversion of unknown phenotypes to event-free \\(0\\) is strictly prohibited"):
+        xena_align(expr, pheno)
+
+
+def test_acquisition_align_and_label_unknown_phenotypes_excluded_not_zero():
+    """
+    Regression Test for src.data.acquisition.align_and_label:
+    Verifies that unknown / unmapped categories are excluded and never silently mapped to 0.
+    """
+    gene_ids = [f"ENSG{i:011d}" for i in range(20)]
+    sample_ids = ["P1", "P2", "P3", "P4", "P5", "P6"]
+
+    expr = pd.DataFrame(np.random.rand(20, 6), index=gene_ids, columns=sample_ids)
+    clinical = pd.DataFrame({
+        "vital_status": ["Dead", "Alive", "Unknown", "Not Reported", "Indeterminate", "Recurred"],
+    }, index=sample_ids)
+
+    X, y = align_and_label(expr, clinical)
+
+    # P1 (Dead -> 1), P2 (Alive -> 0), P6 (Recurred -> 1) are valid.
+    # P3 (Unknown), P4 (Not Reported), P5 (Indeterminate) must be excluded!
+    assert len(X) == 3
+    assert set(X.index) == {"P1", "P2", "P6"}
+    assert y.loc["P1"] == 1
+    assert y.loc["P2"] == 0
+    assert y.loc["P6"] == 1
+    assert "P3" not in y.index
+    assert "P4" not in y.index
+    assert "P5" not in y.index
+
+
+def test_acquisition_align_and_label_only_unknown_categories_raises_value_error():
+    """
+    Regression Test: When all clinical rows contain unknown or unmapped categories,
+    src.data.acquisition.align_and_label must raise ValueError prohibiting silent conversion to 0.
+    """
+    gene_ids = [f"ENSG{i:011d}" for i in range(10)]
+    sample_ids = ["P1", "P2", "P3"]
+
+    expr = pd.DataFrame(np.random.rand(10, 3), index=gene_ids, columns=sample_ids)
+    clinical = pd.DataFrame({
+        "vital_status": ["unknown", "not reported", "discrepancy"],
+    }, index=sample_ids)
+
+    with pytest.raises(ValueError, match="Conversion of unknown phenotypes to event-free \\(0\\) is strictly prohibited"):
+        align_and_label(expr, clinical)
+

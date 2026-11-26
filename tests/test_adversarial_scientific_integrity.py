@@ -1123,3 +1123,157 @@ def test_adversarial_panel_distillation_input_validation_and_alignment():
     assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
     assert report.patient_count == 32
 
+
+def test_adversarial_infinite_survival_times_rejection_across_evaluators():
+    """
+    Adversarial Check P: Strict Finite-Value Validation for Survival Times.
+    Verifies that infinite survival times (np.inf, -np.inf) are strictly rejected and filtered
+    across all survival evaluation functions and data loaders:
+      1. compute_harrell_c_index_with_ci() filters out non-finite times.
+      2. compute_unos_c_index() filters out non-finite times.
+      3. compute_c_index_fast() filters out non-finite times.
+      4. MinimalGenePanelDistiller.fit() filters out non-finite times with 1:1 alignment.
+      5. load_pancan_master_data() strictly excludes rows with inf in PFI.time.
+    """
+    from src.validation.cross_cohort import compute_c_index_fast
+    import retrain_fixed
+
+    # 1. compute_harrell_c_index_with_ci with inf times
+    times = np.array([10.0, 20.0, 30.0, np.inf, -np.inf])
+    events = np.array([1, 0, 1, 1, 1])
+    scores = np.array([0.9, 0.4, 0.2, 0.8, 0.5])
+    res_inf = compute_harrell_c_index_with_ci(scores=scores, times=times, events=events)
+    # Must evaluate on the 3 finite samples without divergence or crash
+    assert res_inf is not None
+    assert "c_index" in res_inf
+    assert res_inf["n_samples"] == 3
+
+    # All infinite times returns unevaluable dictionary with c_index=None
+    all_inf_res = compute_harrell_c_index_with_ci(scores=scores, times=np.full_like(times, np.inf), events=events)
+    assert all_inf_res["c_index"] is None
+    assert all_inf_res["status"] == "unevaluable"
+    assert all_inf_res["n_samples"] == 0
+
+    # 2. compute_unos_c_index with inf times
+    u_inf = compute_unos_c_index(scores=scores, times=times, events=events)
+    assert u_inf is not None
+    assert 0.0 <= u_inf <= 1.0
+
+    # All infinite times returns None
+    assert compute_unos_c_index(scores=scores, times=np.full_like(times, np.inf), events=events) is None
+
+    # 3. compute_c_index_fast with inf times
+    c_fast = compute_c_index_fast(times=times, events=events, risk_scores=scores)
+    assert 0.0 <= c_fast <= 1.0
+
+    # 4. load_pancan_master_data with inf in CDR table
+    samples = [f"TCGA-20-{i:04d}-01A" for i in range(80)]
+    genes = [f"GENE_{i}" for i in range(5)]
+    df_expr = pd.DataFrame(np.random.normal(0, 1, (len(genes), len(samples))), index=genes, columns=samples)
+
+    cdr_rows = []
+    for i, s in enumerate(samples):
+        # Sample 0 has inf time, sample 1 has -inf time
+        if i == 0:
+            t = np.inf
+        elif i == 1:
+            t = -np.inf
+        else:
+            t = 300.0 if i % 2 == 0 else 1500.0
+        cdr_rows.append({"sample": s, "Redaction": None, "PFI": 1 if i % 2 == 0 else 0, "PFI.time": t})
+    df_cdr = pd.DataFrame(cdr_rows).set_index("sample")
+
+    tmp_dir = Path("tests/.tmp_test_inf")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shards_dir = tmp_dir / "data" / "processed" / "shards"
+        shards_dir.mkdir(parents=True, exist_ok=True)
+        df_expr.to_parquet(shards_dir / "TCGA_PANCAN_EB_ADJUST_expression.parquet")
+
+        xena_dir = tmp_dir / "data" / "raw" / "xena"
+        xena_dir.mkdir(parents=True, exist_ok=True)
+        df_cdr.to_csv(xena_dir / "TCGA_CDR_survival.tsv", sep="\t")
+
+        old_root = getattr(retrain_fixed, "ROOT", None)
+        old_xena = getattr(retrain_fixed, "XENA_DIR", None)
+        retrain_fixed.ROOT = tmp_dir
+        retrain_fixed.XENA_DIR = xena_dir
+
+        res = retrain_fixed.load_pancan_master_data(horizon_days=1095, endpoint="PFI")
+        assert res is not None
+        X, y, t_res, e_res = res
+        # Samples 0 and 1 with inf/-inf must be strictly excluded!
+        assert samples[0] not in X.index
+        assert samples[1] not in X.index
+        assert np.isfinite(t_res.values).all()
+        assert (t_res.values > 0).all()
+    finally:
+        if old_root is not None:
+            retrain_fixed.ROOT = old_root
+        if old_xena is not None:
+            retrain_fixed.XENA_DIR = old_xena
+        import shutil
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_adversarial_unknown_phenotype_category_rejection_no_silent_zero():
+    """
+    Adversarial Check Q: Prohibition of Silent Unknown Phenotype Conversion to 0.
+    In oncology survival analysis, a vital status or recurrence record marked 'Unknown',
+    'Not Reported', 'Indeterminate', or 'Discrepancy' must never be imputed as event-free (0).
+    Verifies:
+      1. src.data.acquisition.align_and_label excludes unknown phenotype samples when valid markers exist.
+      2. src.data.xena_acquisition.align_and_label excludes unknown phenotype samples when valid markers exist.
+      3. Both loaders raise explicit ValueError if only unknown markers are present.
+    """
+    from src.data.acquisition import align_and_label as acq_align
+    from src.data.xena_acquisition import align_and_label as xena_align
+
+    genes = [f"G_{i}" for i in range(10)]
+    samples = ["S_DEAD", "S_ALIVE", "S_UNK", "S_NOT_REP", "S_DISC", "S_INDET"]
+    expr = pd.DataFrame(np.random.rand(10, len(samples)), index=genes, columns=samples)
+
+    clinical = pd.DataFrame({
+        "vital_status": [
+            "Dead",
+            "Alive",
+            "Unknown",
+            "Not Reported",
+            "Discrepancy",
+            "Indeterminate",
+        ]
+    }, index=samples)
+
+    # 1. Acquisition loader
+    X_acq, y_acq = acq_align(expr, clinical)
+    assert len(X_acq) == 2
+    assert set(X_acq.index) == {"S_DEAD", "S_ALIVE"}
+    assert y_acq.loc["S_DEAD"] == 1
+    assert y_acq.loc["S_ALIVE"] == 0
+    for bad in ["S_UNK", "S_NOT_REP", "S_DISC", "S_INDET"]:
+        assert bad not in X_acq.index
+
+    # 2. Xena loader
+    X_xena, y_xena = xena_align(expr, clinical)
+    assert len(X_xena) == 2
+    assert set(X_xena.index) == {"S_DEAD", "S_ALIVE"}
+    assert y_xena.loc["S_DEAD"] == 1
+    assert y_xena.loc["S_ALIVE"] == 0
+    for bad in ["S_UNK", "S_NOT_REP", "S_DISC", "S_INDET"]:
+        assert bad not in X_xena.index
+
+    # 3. Only unknown categories present must raise ValueError in both
+    samples_only_unk = ["S_U1", "S_U2", "S_U3"]
+    expr_unk = pd.DataFrame(np.random.rand(10, 3), index=genes, columns=samples_only_unk)
+    clinical_unk = pd.DataFrame({
+        "vital_status": ["unknown", "not reported", "indeterminate"]
+    }, index=samples_only_unk)
+
+    with pytest.raises(ValueError, match="Conversion of unknown phenotypes to event-free"):
+        acq_align(expr_unk, clinical_unk)
+
+    with pytest.raises(ValueError, match="Conversion of unknown phenotypes to event-free"):
+        xena_align(expr_unk, clinical_unk)
+
+

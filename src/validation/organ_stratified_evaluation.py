@@ -76,7 +76,7 @@ def compute_harrell_c_index_with_ci(
     if patient_ids is not None:
         patient_ids = np.asarray(patient_ids)
 
-    valid_mask = (times > 0) & (~np.isnan(times)) & (~np.isnan(events)) & (~np.isnan(scores))
+    valid_mask = (times > 0) & np.isfinite(times) & np.isfinite(scores) & (~np.isnan(events)) & np.isin(events, [0, 1])
     times = times[valid_mask]
     events = events[valid_mask]
     scores = scores[valid_mask]
@@ -225,7 +225,7 @@ def compute_unos_c_index(
     events_arr = np.asarray(events, dtype=int)
     scores_arr = np.asarray(scores, dtype=float)
 
-    valid_mask = (times_arr > 0) & (~np.isnan(times_arr)) & (~np.isnan(events_arr)) & (~np.isnan(scores_arr))
+    valid_mask = (times_arr > 0) & np.isfinite(times_arr) & np.isfinite(scores_arr) & (~np.isnan(events_arr)) & np.isin(events_arr, [0, 1])
     times_clean = times_arr[valid_mask]
     events_clean = events_arr[valid_mask]
     scores_clean = scores_arr[valid_mask]

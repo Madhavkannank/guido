@@ -240,12 +240,77 @@ def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str =
 
     X = expr[common_patients].T  # samples × genes
     y_raw = clinical.loc[common_patients, label_col]
+
+    # Exclude missing events (prohibit converting NaN events to censored 0)
+    valid_event_mask = y_raw.notna()
+    if not valid_event_mask.all():
+        dropped_count = int((~valid_event_mask).sum())
+        logger.warning(
+            "Excluding %d samples with missing outcome labels (prohibiting silent conversion of NaN to censored 0).",
+            dropped_count
+        )
+        X = X.loc[valid_event_mask]
+        y_raw = y_raw.loc[valid_event_mask]
+
+    # Standardize oncology event coding (1 = Dead / Event, 0 = Alive / Event-Free)
     if pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == "object":
         y_lower = y_raw.astype(str).str.strip().str.lower()
         event_markers = {"dead", "deceased", "recurred", "relapsed", "progressed", "event", "yes", "true", "1", "1.0"}
-        y = y_lower.isin(event_markers).astype(int)
+        free_markers  = {"alive", "disease free", "progression free", "no event", "censored", "no", "false", "0", "0.0"}
+
+        is_event = y_lower.isin(event_markers)
+        is_free = y_lower.isin(free_markers)
+        valid_marker_mask = is_event | is_free
+
+        if valid_marker_mask.any():
+            # Prohibit converting unknown phenotype categories to event-free (0)
+            n_unmapped = int((~valid_marker_mask).sum())
+            if n_unmapped > 0:
+                unmapped_categories = sorted(list(y_lower.loc[~valid_marker_mask].unique()))
+                logger.warning(
+                    "Excluding %d sample(s) with unknown or unmapped phenotype categories (%s) "
+                    "— prohibiting silent conversion to event-free (0).",
+                    n_unmapped, unmapped_categories
+                )
+                X = X.loc[valid_marker_mask]
+                y_lower = y_lower.loc[valid_marker_mask]
+                is_event = is_event.loc[valid_marker_mask]
+
+            y = is_event.astype(int)
+        else:
+            unique_vals = y_lower.dropna().unique()
+            unknown_markers = {
+                "unknown", "not reported", "[not reported]", "not available", "[not available]",
+                "indeterminate", "equivocal", "discrepancy", "nan", "null", "none", "unresolved"
+            }
+            if any(val in unknown_markers for val in unique_vals):
+                raise ValueError(
+                    f"Phenotype column '{label_col}' contains invalid/unknown categories ({list(unique_vals)}). "
+                    "Conversion of unknown phenotypes to event-free (0) is strictly prohibited."
+                )
+            if len(unique_vals) == 2:
+                val_counts = y_lower.value_counts()
+                event_val = val_counts.index[-1]
+                y = (y_lower == event_val).astype(int)
+            else:
+                raise ValueError(f"Unable to resolve binary event mapping for column '{label_col}'. Values: {unique_vals}")
     else:
-        y = (y_raw != 0).astype(int)
+        y_num = pd.to_numeric(y_raw, errors="coerce")
+        valid_num_mask = y_num.notna() & y_num.isin([0, 1])
+        if not valid_num_mask.all():
+            logger.warning(
+                "Excluding %d samples with invalid numeric event values (must be 0 or 1).",
+                int((~valid_num_mask).sum())
+            )
+            X = X.loc[valid_num_mask]
+            y_num = y_num.loc[valid_num_mask]
+        y = y_num.astype(int)
+
+    if len(y) == 0:
+        raise ValueError(
+            f"No valid binary outcome labels remain for column '{label_col}' after excluding invalid/missing values."
+        )
+
     y.name = "label"
     return X, y
 

@@ -247,10 +247,22 @@ def download_metabric(external: Path) -> bool:
 
         if "RFS_MONTHS" in df_clin.columns and "RFS_STATUS" in df_clin.columns:
             time_days = pd.to_numeric(df_clin["RFS_MONTHS"], errors="coerce") * 30.4375
-            events = df_clin["RFS_STATUS"].astype(str).str.contains("Recurred|1", case=False, na=False).astype(int)
-        else:
+            rfs_str = df_clin["RFS_STATUS"].astype(str).str.strip()
+            is_event = rfs_str.str.startswith("1") | (rfs_str.str.contains("Recurred", case=False, na=False) & ~rfs_str.str.contains("Not", case=False, na=False))
+            is_free = rfs_str.str.startswith("0") | rfs_str.str.contains("Not Recurred", case=False, na=False)
+            events = pd.Series(np.nan, index=df_clin.index)
+            events[is_event] = 1.0
+            events[is_free] = 0.0
+        elif "OS_MONTHS" in df_clin.columns and "OS_STATUS" in df_clin.columns:
             time_days = pd.to_numeric(df_clin["OS_MONTHS"], errors="coerce") * 30.4375
-            events = df_clin["OS_STATUS"].astype(str).str.contains("DECEASED|1", case=False, na=False).astype(int)
+            os_str = df_clin["OS_STATUS"].astype(str).str.strip()
+            is_event = os_str.str.startswith("1") | (os_str.str.contains("DECEASED|Dead", case=False, na=False) & ~os_str.str.contains("Living|Alive", case=False, na=False))
+            is_free = os_str.str.startswith("0") | os_str.str.contains("Living|Alive", case=False, na=False)
+            events = pd.Series(np.nan, index=df_clin.index)
+            events[is_event] = 1.0
+            events[is_free] = 0.0
+        else:
+            raise ValueError("Required survival columns missing in METABRIC clinical table.")
 
         # Expression
         req_expr = urllib.request.Request(METABRIC_EXPR_URL, headers={"User-Agent": USER_AGENT})
@@ -262,7 +274,15 @@ def download_metabric(external: Path) -> bool:
         if "Hugo_Symbol" in df_expr.columns:
             df_expr = df_expr.dropna(subset=["Hugo_Symbol"]).drop_duplicates(subset=["Hugo_Symbol"]).set_index("Hugo_Symbol")
 
-        common = [p for p in df_clin.index if p in df_expr.columns and not pd.isna(time_days.loc[p])]
+        common = [
+            p for p in df_clin.index
+            if p in df_expr.columns
+            and not pd.isna(time_days.loc[p])
+            and np.isfinite(time_days.loc[p])
+            and time_days.loc[p] > 0
+            and not pd.isna(events.loc[p])
+            and events.loc[p] in (0, 1)
+        ]
         X_df = df_expr[common].T.astype(float).fillna(0.0)
         time_series = time_days.loc[common].astype(float)
         event_series = events.loc[common].astype(int)
@@ -339,17 +359,29 @@ def download_geo_cohorts(external: Path) -> bool:
                     meta_lines.append(line.rstrip("\r\n"))
                 df_probes = pd.read_csv(gz, sep="\t", comment="!", index_col=0, low_memory=False)
 
-            sample_ids, relapse_status, relapse_days = [], [], []
+                sample_ids, relapse_status, relapse_days = [], [], []
             for line in meta_lines:
                 if line.startswith("!Sample_geo_accession"):
                     sample_ids = [s.strip('"') for s in line.split("\t")[1:]]
-                elif "!Sample_characteristics_ch1\t\"relapse:" in line or (line.startswith("!Sample_characteristics_ch1") and "relapse:" in line and "days" not in line):
-                    relapse_status = [1 if ("relapsed" in s and "not relapsed" not in s) else 0 for s in line.split("\t")[1:]]
+                elif "!Sample_characteristics_ch1\t\"relapse:" in line or (
+                    line.startswith("!Sample_characteristics_ch1") and "relapse:" in line and "days" not in line and "months" not in line
+                ):
+                    for s in line.split("\t")[1:]:
+                        s_clean = s.strip('" ').lower()
+                        if "relapsed" in s_clean and "not relapsed" not in s_clean:
+                            relapse_status.append(1)
+                        elif "not relapsed" in s_clean:
+                            relapse_status.append(0)
+                        else:
+                            relapse_status.append(np.nan)
                 elif "days before relapse/censor:" in line:
                     for s in line.split("\t")[1:]:
                         v = s.split(":")[-1].strip('" ')
-                        try: relapse_days.append(float(v))
-                        except Exception: relapse_days.append(np.nan)
+                        try:
+                            f_val = float(v)
+                            relapse_days.append(f_val if np.isfinite(f_val) and f_val > 0 else np.nan)
+                        except Exception:
+                            relapse_days.append(np.nan)
 
             if probe_map:
                 df_probes["gene"] = df_probes.index.map(probe_map)
@@ -361,7 +393,12 @@ def download_geo_cohorts(external: Path) -> bool:
             df_genes.columns = [c.strip('"') for c in df_genes.columns]
             common = [s for s in sample_ids if s in df_genes.columns]
 
-            clin = pd.DataFrame({"sample_id": sample_ids[:len(relapse_status)], "relapse": relapse_status, "days": relapse_days[:len(relapse_status)]}).set_index("sample_id").loc[common].dropna()
+            clin = pd.DataFrame({
+                "sample_id": sample_ids[:len(relapse_status)],
+                "relapse": relapse_status,
+                "days": relapse_days[:len(relapse_status)],
+            }).set_index("sample_id").loc[common].dropna()
+            clin = clin[(clin["days"] > 0) & np.isfinite(clin["days"]) & clin["relapse"].isin([0, 1])]
             X_df = df_genes[clin.index].T.astype(float).fillna(0.0)
             t_ser = clin["days"].astype(float)
             e_ser = clin["relapse"].astype(int)

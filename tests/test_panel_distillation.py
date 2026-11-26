@@ -243,3 +243,56 @@ def test_distiller_invalid_event_values_handled_with_strict_alignment(synthetic_
     assert len(distiller.oof_comparator_scores_) == expected_n
     assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
 
+
+def test_distiller_infinite_survival_times_excluded_with_strict_alignment(synthetic_expression_cohort):
+    """
+    Regression Test: Verifies that survival times with np.inf, -np.inf, and zero/negative values
+    are strictly rejected and excluded prior to Cox distillation, preserving synchronous 1:1
+    alignment across expression rows, times, events, and patient identifiers.
+    """
+    df_X, times, events = synthetic_expression_cohort
+    times_with_inf = times.astype(float).copy()
+    # Introduce inf, -inf, and 0
+    inf_indices = [2, 14, 28, 45]
+    times_with_inf[inf_indices[0]] = np.inf
+    times_with_inf[inf_indices[1]] = -np.inf
+    times_with_inf[inf_indices[2]] = np.inf
+    times_with_inf[inf_indices[3]] = 0.0
+
+    patient_ids = [f"TCGA-PT-{i:04d}" for i in range(len(df_X))]
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3, random_state=42)
+    report = distiller.fit(
+        df_X=df_X,
+        times=times_with_inf,
+        events=events,
+        patient_ids=patient_ids,
+        data_source="infinite_time_test",
+        is_synthetic=True,
+    )
+
+    expected_n = len(df_X) - len(inf_indices)
+    assert report.n_samples == expected_n
+    assert len(distiller.oof_comparator_scores_) == expected_n
+    assert report.patient_grouping_status == "patient_grouped_strictly_partitioned"
+
+
+def test_distiller_all_infinite_times_raises_value_error(synthetic_expression_cohort):
+    """
+    Regression Test: Verifies that if all survival times are infinite or non-positive,
+    MinimalGenePanelDistiller raises an explicit ValueError.
+    """
+    df_X, times, events = synthetic_expression_cohort
+    all_inf_times = np.full_like(times, np.inf)
+
+    distiller = MinimalGenePanelDistiller(panel_sizes=[15], n_folds=3, random_state=42)
+    with pytest.raises(ValueError, match="No valid survival records remain after excluding non-finite"):
+        distiller.fit(
+            df_X=df_X,
+            times=all_inf_times,
+            events=events,
+            data_source="all_inf_test",
+            is_synthetic=True,
+        )
+
+

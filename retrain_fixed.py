@@ -369,7 +369,7 @@ def load_pancan_master_data(
             event_col = "OS"
             time_col = "OS.time"
 
-        # Explicitly exclude missing events (no fillna(0)) and non-positive follow-up times
+        # Explicitly exclude missing events (no fillna(0)) and non-positive / non-finite follow-up times
         raw_events = pd.to_numeric(sub_cdr[event_col], errors="coerce")
         raw_times = pd.to_numeric(sub_cdr[time_col], errors="coerce")
 
@@ -377,6 +377,7 @@ def load_pancan_master_data(
             raw_events.notna() &
             raw_events.isin([0, 1]) &
             raw_times.notna() &
+            np.isfinite(raw_times) &
             (raw_times > 0)
         )
         final_samples = [s for s in deduplicated_samples if valid_endpoint_mask.loc[s]]
@@ -547,6 +548,7 @@ def load_cohort_data(
         raw_cohort_events.notna() &
         raw_cohort_events.isin([0, 1]) &
         raw_cohort_times.notna() &
+        np.isfinite(raw_cohort_times) &
         (raw_cohort_times > 0)
     )
     missing_followup_excluded = int((~valid_endpoint_mask).sum())
