@@ -124,6 +124,77 @@ def is_valid_clinical_artifact(path: Path) -> bool:
         return False
 
 
+def _predict_single_artifact(sample: Any, artifact: Any) -> Tuple[Optional[float], Optional[Any], Optional[Any]]:
+    """Standardizes features, scales, and infers recurrence probability from a clinical model artifact."""
+    import pandas as pd
+    import numpy as np
+
+    if not isinstance(artifact, dict):
+        model = artifact
+        scaler = None
+        target_features = None
+        sample_eval = sample.copy()
+    else:
+        model = artifact.get("model", artifact)
+        scaler = artifact.get("scaler")
+        target_features = artifact.get("features")
+        sample_eval = sample.copy()
+
+        # Compute hallmark metagenes if expected by model artifact using training baseline statistics
+        if "hallmark_metagenes" in artifact:
+            hallmarks = artifact["hallmark_metagenes"]
+            meta_stats = artifact.get("metagene_stats", {})
+            for meta_name, gene_list in hallmarks.items():
+                if meta_name not in sample_eval.columns:
+                    z_cols = []
+                    for g in gene_list:
+                        if g in sample_eval.columns:
+                            mu = meta_stats[g]["mean"] if g in meta_stats else float(sample_eval[g].mean())
+                            sigma = meta_stats[g]["std"] if g in meta_stats else 1.0
+                            z = (sample_eval[g].values - mu) / (sigma + 1e-6)
+                            z_cols.append(z)
+                    if z_cols:
+                        sample_eval[meta_name] = np.mean(np.column_stack(z_cols), axis=1)
+                    else:
+                        sample_eval[meta_name] = 0.0
+
+    if target_features:
+        X = sample_eval.reindex(columns=list(target_features), fill_value=0.0)
+    else:
+        X = sample_eval
+
+    if scaler is not None:
+        try:
+            X_vals = X.values if hasattr(X, "values") else X
+            X_scaled = scaler.transform(X_vals)
+            X = pd.DataFrame(X_scaled, columns=X.columns)
+        except Exception:
+            pass
+
+    try:
+        if hasattr(model, "predict_proba"):
+            try:
+                prob = float(model.predict_proba(X.values)[:, 1][0])
+            except Exception:
+                prob = float(model.predict_proba(X)[:, 1][0])
+        elif hasattr(model, "decision_function"):
+            try:
+                s = model.decision_function(X.values)[0]
+            except Exception:
+                s = model.decision_function(X)[0]
+            prob = float(1 / (1 + np.exp(-s)))
+        else:
+            try:
+                pred = model.predict(X.values)[0]
+            except Exception:
+                pred = model.predict(X)[0]
+            prob = float(pred)
+    except Exception:
+        prob = None
+
+    return prob, model, X
+
+
 @app.post("/api/ui/predict", tags=["UI"])
 async def ui_predict(
     project_id: str = Form("TCGA-PAN-CANCER-ALL"),
@@ -171,11 +242,11 @@ async def ui_predict(
             "TCGA-KIRC": "TCGA-PAN-RENAL", "TCGA-KIRP": "TCGA-PAN-RENAL", "TCGA-KICH": "TCGA-PAN-RENAL",
             "TCGA-LUAD": "TCGA-PAN-LUNG",  "TCGA-LUSC": "TCGA-PAN-LUNG",
             "TCGA-COAD": "TCGA-PAN-GI",    "TCGA-READ": "TCGA-PAN-GI", "TCGA-STAD": "TCGA-PAN-GI", "TCGA-ESCA": "TCGA-PAN-GI",
-            "TCGA-LIHC": "TCGA-PAN-HEPATOBILIARY", "TCGA-CHOL": "TCGA-PAN-HEPATOBILIARY",
+            "TCGA-LIHC": "TCGA-PAN-HEPATOBILIARY", "TCGA-CHOL": "TCGA-PAN-HEPATOBILIARY", "TCGA-PAAD": "TCGA-PAN-GI",
             "TCGA-BRCA": "TCGA-PAN-BREAST",
             "TCGA-LGG" : "TCGA-PAN-BRAIN", "TCGA-GBM": "TCGA-PAN-BRAIN",
             "TCGA-OV"  : "TCGA-PAN-GYN",   "TCGA-UCEC": "TCGA-PAN-GYN", "TCGA-CESC": "TCGA-PAN-GYN", "TCGA-UCS": "TCGA-PAN-GYN",
-            "TCGA-BLCA": "TCGA-PAN-UROLOGICAL", "TCGA-PRAD": "TCGA-PAN-UROLOGICAL",
+            "TCGA-BLCA": "TCGA-PAN-UROLOGICAL", "TCGA-PRAD": "TCGA-PAN-UROLOGICAL", "TCGA-TGCT": "TCGA-PAN-UROLOGICAL",
             "TCGA-HNSC": "TCGA-PAN-HEADNECK",
             "TCGA-THCA": "TCGA-PAN-ENDOCRINE", "TCGA-ACC": "TCGA-PAN-ENDOCRINE", "TCGA-PCPG": "TCGA-PAN-ENDOCRINE",
             "TCGA-SARC": "TCGA-PAN-SARCOMA",
@@ -186,12 +257,19 @@ async def ui_predict(
         if prefixed_proj in ORGAN_MAP:
             clinical_candidates.append(MODELS_DIR / ORGAN_MAP[prefixed_proj] / "xgboost_clinical_model.joblib")
 
-        # Global Master Pan-Cancer fallback (trained on all 33 TCGA cohorts + external hospital benchmarks)
-        if unprefixed_proj.upper() in ALL_VALID_COHORTS or prefixed_proj in ORGAN_MAP:
-            clinical_candidates.append(MODELS_DIR / "TCGA-PAN-CANCER-ALL" / "xgboost_clinical_model.joblib")
+        organ_model_path = next((p for p in clinical_candidates if p.exists() and is_valid_clinical_artifact(p)), None)
 
-        model_path = next((p for p in clinical_candidates if p.exists() and is_valid_clinical_artifact(p)), None)
-        if model_path is None:
+        is_known_cohort = (
+            unprefixed_proj.upper() in ALL_VALID_COHORTS
+            or prefixed_proj in ORGAN_MAP
+            or norm_proj in ALL_VALID_COHORTS
+        )
+
+        # Global Master Pan-Cancer model path
+        pancan_model_path = MODELS_DIR / "TCGA-PAN-CANCER-ALL" / "xgboost_clinical_model.joblib"
+        has_pancan = is_known_cohort and pancan_model_path.exists() and is_valid_clinical_artifact(pancan_model_path)
+
+        if organ_model_path is None and not has_pancan:
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -200,6 +278,8 @@ async def ui_predict(
                     f"Please calibrate the clinical recurrence model using: py -3.12 retrain_fixed.py {project_id}"
                 ),
             )
+
+        model_path = organ_model_path if organ_model_path is not None else pancan_model_path
         model_artifact = joblib.load(model_path)
 
         # unwrap dict-based artifacts: {'model': estimator, 'scaler': scaler, 'features': [...]}
@@ -247,90 +327,47 @@ async def ui_predict(
                 detail=f"Clinical Sample Quality Control Rejection: {reasons_str}"
             )
 
-        # Compute hallmark metagenes if expected by model artifact using training baseline statistics
-        if isinstance(model_artifact, dict) and "hallmark_metagenes" in model_artifact:
-            hallmarks = model_artifact["hallmark_metagenes"]
-            meta_stats = model_artifact.get("metagene_stats", {})
-            for meta_name, gene_list in hallmarks.items():
-                if meta_name not in sample.columns:
-                    z_cols = []
-                    for g in gene_list:
-                        if g in sample.columns:
-                            mu = meta_stats[g]["mean"] if g in meta_stats else float(sample[g].mean())
-                            sigma = meta_stats[g]["std"] if g in meta_stats else 1.0
-                            z = (sample[g].values - mu) / (sigma + 1e-6)
-                            z_cols.append(z)
-                    if z_cols:
-                        sample[meta_name] = np.mean(np.column_stack(z_cols), axis=1)
-                    else:
-                        sample[meta_name] = 0.0
+        # Dual-Consensus Inference Execution (70% Organ Specialist / 30% Pan-Cancer Master)
+        p_organ = None
+        p_pancan = None
+        model_used = None
+        X_used = None
 
-        # align features to model's expected features (no splits needed)
-        splits = None
-        train_cols = None
+        if organ_model_path is not None:
+            p_organ, model_used, X_used = _predict_single_artifact(sample, model_artifact)
 
-        # 1. Use feature list embedded in model artifact dict (most reliable)
-        if model_features:
-            train_cols = list(model_features)
+        if has_pancan:
+            pancan_artifact = joblib.load(pancan_model_path) if organ_model_path != pancan_model_path else model_artifact
+            p_pancan, p_model, p_X = _predict_single_artifact(sample, pancan_artifact)
+            if model_used is None:
+                model_used = p_model
+                X_used = p_X
 
-        # 2. Try to get feature names from the estimator itself
-        if train_cols is None:
-            try:
-                est = model
-                if hasattr(model, 'steps'):
-                    est = model.steps[-1][1]
-                if hasattr(est, 'feature_names_in_'):
-                    train_cols = list(est.feature_names_in_)
-                elif hasattr(est, 'feature_names'):
-                    train_cols = list(est.feature_names)
-            except Exception:
-                pass
+        is_dual_consensus = (
+            p_organ is not None
+            and p_pancan is not None
+            and organ_model_path is not None
+            and organ_model_path.parent.name != "TCGA-PAN-CANCER-ALL"
+        )
 
-        # 3. Fallback: try loading splits parquet
-        if train_cols is None:
-            try:
-                splits = _load_splits(project_id)
-                train_cols = list(splits['train'][0].columns)
-            except Exception:
-                pass
-
-        # 4. Align columns or use as-is
-        if train_cols:
-            X = sample.reindex(columns=train_cols, fill_value=0)
+        if is_dual_consensus:
+            # 70% Organ Specialist + 30% Pan-Cancer Master
+            prob = float(0.70 * p_organ + 0.30 * p_pancan)
+            consensus_mode = "Dual-Consensus (70% Organ Specialist / 30% Pan-Cancer Master)"
+            tier_organ = "Low Risk" if p_organ < 0.35 else ("High Risk" if p_organ > 0.65 else "Moderate Risk")
+            tier_pancan = "Low Risk" if p_pancan < 0.35 else ("High Risk" if p_pancan > 0.65 else "Moderate Risk")
+            concordance = "Concordant" if tier_organ == tier_pancan else f"Divergent (Organ: {tier_organ}, PanCan: {tier_pancan})"
+        elif p_organ is not None:
+            prob = float(p_organ)
+            consensus_mode = f"Single Model ({organ_model_path.parent.name})"
+            concordance = "N/A (Single Model)"
         else:
-            X = sample
+            prob = float(p_pancan)
+            consensus_mode = "Single Model (TCGA-PAN-CANCER-ALL Global Fallback)"
+            concordance = "N/A (Global Fallback)"
 
-        # apply scaler if present
-        if scaler is not None:
-            try:
-                X_vals = X.values if hasattr(X, "values") else X
-                X_scaled = scaler.transform(X_vals)
-                X = pd.DataFrame(X_scaled, columns=X.columns)
-            except Exception:
-                pass
-
-        # predict
-        try:
-            if hasattr(model, "predict_proba"):
-                try:
-                    prob = float(model.predict_proba(X.values)[:, 1][0])
-                except Exception:
-                    prob = float(model.predict_proba(X)[:, 1][0])
-            else:
-                if hasattr(model, "decision_function"):
-                    try:
-                        s = model.decision_function(X.values)[0]
-                    except Exception:
-                        s = model.decision_function(X)[0]
-                    prob = float(1 / (1 + np.exp(-s)))
-                else:
-                    try:
-                        pred = model.predict(X.values)[0]
-                    except Exception:
-                        pred = model.predict(X)[0]
-                    prob = float(pred)
-        except Exception:
-            prob = None
+        model = model_used if model_used is not None else (model_artifact.get('model', model_artifact) if isinstance(model_artifact, dict) else model_artifact)
+        X = X_used if X_used is not None else sample
 
         threshold = 0.5
         if isinstance(model_artifact, dict) and "optimal_threshold" in model_artifact:
@@ -364,6 +401,10 @@ async def ui_predict(
             "recommendation": recommendation,
             "threshold": threshold,
             "model": str(model_path.name),
+            "consensus_mode": consensus_mode,
+            "organ_risk_score": round(float(p_organ * 100), 1) if p_organ is not None else None,
+            "pancan_risk_score": round(float(p_pancan * 100), 1) if p_pancan is not None else None,
+            "model_concordance": concordance,
             "task": "Genomic Disease Risk Prediction",
             "time": "0.0s",
             "sample_qc": {
@@ -420,8 +461,16 @@ async def ui_predict(
         stability_scores = {}
 
         # 1. Load training summary (split sizes + AUROC metrics)
-        for summary_name in ['xgboost_clinical_summary.json', 'xgboost_summary.json']:
-            summary_path = RESULTS_DIR / project_id / summary_name
+        summary_candidates = [
+            RESULTS_DIR / project_id / 'xgboost_clinical_summary.json',
+            RESULTS_DIR / project_id / 'xgboost_summary.json',
+            RESULTS_DIR / prefixed_proj / 'xgboost_clinical_summary.json',
+        ]
+        if prefixed_proj in ORGAN_MAP:
+            summary_candidates.append(RESULTS_DIR / ORGAN_MAP[prefixed_proj] / 'xgboost_clinical_summary.json')
+        summary_candidates.append(RESULTS_DIR / 'TCGA-PAN-CANCER-ALL' / 'xgboost_clinical_summary.json')
+
+        for summary_path in summary_candidates:
             if summary_path.exists():
                 try:
                     with open(summary_path) as _f:
@@ -430,7 +479,7 @@ async def ui_predict(
                     val_n = int(_s.get('split_val', 0))
                     model_metrics = {
                         'val_auroc': _s.get('val_auroc', None),
-                        'test_auroc': _s.get('test_auroc', None),
+                        'test_auroc': _s.get('test_auroc', _s.get('test_risk_auroc', None)),
                         'n_features': _s.get('n_features', len(X.columns)),
                     }
                     break

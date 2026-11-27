@@ -275,6 +275,36 @@ def test_api_ui_predict_success_with_trained_model():
     assert "sample_qc" in pred
     assert pred["regulatory_classification"] == "Research Use Only (RUO)"
     assert "clinical_disclaimer" in pred
+    # Dual-consensus diagnostics
+    assert "consensus_mode" in pred
+    assert "organ_risk_score" in pred
+    assert "pancan_risk_score" in pred
+    assert "model_concordance" in pred
+
+
+def test_api_ui_predict_dual_consensus_blending_weights():
+    """Verify that predictions on organ cohorts accurately blend 70% Organ and 30% Pan-Cancer models."""
+    client = TestClient(app)
+    response = client.post(
+        "/api/ui/predict",
+        data={
+            "project_id": "TCGA-KIRC",
+            "disease_name": "clear_cell_renal_cell_carcinoma",
+            "json_payload": '{"MKI67": 8.5, "PCNA": 9.2, "VEGFA": 11.8, "HIF1A": 10.0}'
+        }
+    )
+    assert response.status_code == 200
+    data = response.json()
+    pred = data["prediction"]
+    assert "Dual-Consensus" in pred["consensus_mode"]
+    assert pred["organ_risk_score"] is not None
+    assert pred["pancan_risk_score"] is not None
+    # Verify 70/30 mathematical blend: prob ≈ 0.70 * p_organ + 0.30 * p_pancan
+    p_org = pred["organ_risk_score"] / 100.0
+    p_pan = pred["pancan_risk_score"] / 100.0
+    expected_prob = 0.70 * p_org + 0.30 * p_pan
+    assert abs(pred["prob"] - expected_prob) < 1e-3
+    assert pred["model_concordance"] in ("Concordant",) or "Divergent" in pred["model_concordance"]
 
 
 def test_api_ui_predict_qc_rejection_on_severe_degradation():
