@@ -31,6 +31,7 @@ from retrain_fixed import (
     compute_c_index,
     compute_ipcw_weights,
     compute_leak_free_hallmarks,
+    load_cohort_methylation,
 )
 from src.api.app import app
 from src.validation.cross_cohort import (
@@ -274,6 +275,36 @@ def test_api_ui_predict_success_with_trained_model():
     assert "sample_qc" in pred
     assert pred["regulatory_classification"] == "Research Use Only (RUO)"
     assert "clinical_disclaimer" in pred
+    # Dual-consensus diagnostics
+    assert "consensus_mode" in pred
+    assert "organ_risk_score" in pred
+    assert "pancan_risk_score" in pred
+    assert "model_concordance" in pred
+
+
+def test_api_ui_predict_dual_consensus_blending_weights():
+    """Verify that predictions on organ cohorts accurately blend 70% Organ and 30% Pan-Cancer models."""
+    client = TestClient(app)
+    response = client.post(
+        "/api/ui/predict",
+        data={
+            "project_id": "TCGA-KIRC",
+            "disease_name": "clear_cell_renal_cell_carcinoma",
+            "json_payload": '{"MKI67": 8.5, "PCNA": 9.2, "VEGFA": 11.8, "HIF1A": 10.0}'
+        }
+    )
+    assert response.status_code == 200
+    data = response.json()
+    pred = data["prediction"]
+    assert "Dual-Consensus" in pred["consensus_mode"]
+    assert pred["organ_risk_score"] is not None
+    assert pred["pancan_risk_score"] is not None
+    # Verify 70/30 mathematical blend: prob ≈ 0.70 * p_organ + 0.30 * p_pancan
+    p_org = pred["organ_risk_score"] / 100.0
+    p_pan = pred["pancan_risk_score"] / 100.0
+    expected_prob = 0.70 * p_org + 0.30 * p_pan
+    assert abs(pred["prob"] - expected_prob) < 1e-3
+    assert pred["model_concordance"] in ("Concordant",) or "Divergent" in pred["model_concordance"]
 
 
 def test_api_ui_predict_qc_rejection_on_severe_degradation():
@@ -378,5 +409,71 @@ def test_cross_platform_gene_alias_resolution():
     # Verify values transferred from legacy columns
     np.testing.assert_allclose(aligned["NUF2"].values, X_legacy["CDCA1"].values, rtol=1e-5)
     np.testing.assert_allclose(aligned["CEP55"].values, X_legacy["C10orf3"].values, rtol=1e-5)
+
+
+def test_load_cohort_methylation_barcode_alignment(tmp_path, monkeypatch):
+    """Verify that multi-omics methylation matrices align patient barcodes to 12-char IDs and prefix probes with METH_."""
+    shards_dir = tmp_path / "data" / "processed" / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    pq_path = shards_dir / "TCGA_KICH_methylation.parquet"
+
+    patients = [f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+    meth_barcodes = [f"{pt}-01" for pt in patients]
+    probes = [f"cg{i:08d}" for i in range(1, 25)]
+
+    rng = np.random.default_rng(42)
+    data = rng.uniform(0.1, 0.9, size=(len(probes), len(meth_barcodes)))
+    data[0, :] = np.linspace(0.01, 0.99, len(meth_barcodes))  # highest variance
+
+    df_meth = pd.DataFrame(data, index=probes, columns=meth_barcodes)
+    df_meth.to_parquet(pq_path)
+
+    import retrain_fixed
+    monkeypatch.setattr(retrain_fixed, "ROOT", tmp_path)
+
+    target_samples = [f"TCGA-KL-{i:04d}-01" if i % 2 == 0 else f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+
+    df_aligned = load_cohort_methylation("KICH", target_samples=target_samples, max_probes=5)
+
+    assert df_aligned is not None
+    assert df_aligned.shape == (len(target_samples), 5)
+    assert all(c.startswith("METH_") for c in df_aligned.columns)
+    assert df_aligned.columns[0] == "METH_cg00000001"
+    assert list(df_aligned.index) == target_samples
+    assert not df_aligned.isna().any().any()
+
+
+def test_load_cohort_methylation_tsv_streaming_alignment(tmp_path, monkeypatch):
+    """Verify that multi-omics methylation raw TSV streaming extracts top variance probes without memory spikes."""
+    xena_dir = tmp_path / "data" / "raw" / "xena"
+    xena_dir.mkdir(parents=True, exist_ok=True)
+    tsv_path = xena_dir / "TCGA.KICH.sampleMap_HumanMethylation450.tsv"
+
+    patients = [f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+    meth_barcodes = [f"{pt}-01" for pt in patients]
+    probes = [f"cg{i:08d}" for i in range(1, 30)]
+
+    rng = np.random.default_rng(42)
+    data = rng.uniform(0.1, 0.9, size=(len(probes), len(meth_barcodes)))
+    data[7, :] = np.linspace(0.01, 0.99, len(meth_barcodes))  # probe 8 has highest variance
+
+    df_meth = pd.DataFrame(data, index=probes, columns=meth_barcodes)
+    df_meth.to_csv(tsv_path, sep="\t", index_label="sample")
+
+    import retrain_fixed
+    monkeypatch.setattr(retrain_fixed, "ROOT", tmp_path)
+    monkeypatch.setattr(retrain_fixed, "XENA_DIR", xena_dir)
+
+    target_samples = [f"TCGA-KL-{i:04d}-01" if i % 2 == 0 else f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+
+    df_aligned = load_cohort_methylation("KICH", target_samples=target_samples, max_probes=5)
+
+    assert df_aligned is not None
+    assert df_aligned.shape == (len(target_samples), 5)
+    assert all(c.startswith("METH_") for c in df_aligned.columns)
+    assert df_aligned.columns[0] == "METH_cg00000008"
+    assert list(df_aligned.index) == target_samples
+    assert not df_aligned.isna().any().any()
+
 
 

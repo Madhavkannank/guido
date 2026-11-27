@@ -54,10 +54,17 @@ except ImportError:
 # ─── High-Performance Concordance Index ──────────────────────────────────────
 
 def compute_c_index_fast(times: np.ndarray, events: np.ndarray, risk_scores: np.ndarray) -> float:
-    """Computes Harrell's C-Index handling right-censoring in O(N log N) time."""
+    """Computes Harrell's C-Index handling right-censoring in O(N log N) time with finite-value validation."""
     times = np.asarray(times, dtype=float)
     events = np.asarray(events, dtype=int)
     scores = np.asarray(risk_scores, dtype=float)
+
+    # Finite and positive time validation
+    valid = np.isfinite(times) & np.isfinite(scores) & (times > 0) & np.isin(events, [0, 1])
+    times = times[valid]
+    events = events[valid]
+    scores = scores[valid]
+
     n = len(times)
     if n < 2:
         return 0.5

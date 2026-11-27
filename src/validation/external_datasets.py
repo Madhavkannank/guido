@@ -93,7 +93,9 @@ def fetch_metabric(
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     Fetches and harmonizes the METABRIC breast cancer cohort (~1,980 patients).
-    If network is unavailable or download fails, falls back gracefully to synthetic benchmark.
+    Raises RuntimeError if network is unavailable or download fails (no silent synthetic fallback).
+    For offline testing, use generate_synthetic_external_cohort() explicitly.
+
     Returns:
         (expression_df, binary_3yr_risk, times_days, events)
     """
@@ -136,11 +138,19 @@ def fetch_metabric(
         if "RFS_MONTHS" in df_clin.columns and "RFS_STATUS" in df_clin.columns:
             time_days = pd.to_numeric(df_clin["RFS_MONTHS"], errors="coerce") * 30.4375
             rfs_str = df_clin["RFS_STATUS"].astype(str).str.strip()
-            events = (rfs_str.str.startswith("1") | (rfs_str.str.contains("Recurred", case=False, na=False) & ~rfs_str.str.contains("Not", case=False, na=False))).astype(int)
+            is_event = rfs_str.str.startswith("1") | (rfs_str.str.contains("Recurred", case=False, na=False) & ~rfs_str.str.contains("Not", case=False, na=False))
+            is_free = rfs_str.str.startswith("0") | rfs_str.str.contains("Not Recurred", case=False, na=False)
+            events = pd.Series(np.nan, index=df_clin.index)
+            events[is_event] = 1.0
+            events[is_free] = 0.0
         elif "OS_MONTHS" in df_clin.columns and "OS_STATUS" in df_clin.columns:
             time_days = pd.to_numeric(df_clin["OS_MONTHS"], errors="coerce") * 30.4375
             os_str = df_clin["OS_STATUS"].astype(str).str.strip()
-            events = (os_str.str.startswith("1") | (os_str.str.contains("DECEASED|Dead", case=False, na=False) & ~os_str.str.contains("Living|Alive", case=False, na=False))).astype(int)
+            is_event = os_str.str.startswith("1") | (os_str.str.contains("DECEASED|Dead", case=False, na=False) & ~os_str.str.contains("Living|Alive", case=False, na=False))
+            is_free = os_str.str.startswith("0") | os_str.str.contains("Living|Alive", case=False, na=False)
+            events = pd.Series(np.nan, index=df_clin.index)
+            events[is_event] = 1.0
+            events[is_free] = 0.0
         else:
             raise ValueError("Required survival columns missing in METABRIC clinical table.")
 
@@ -158,7 +168,15 @@ def fetch_metabric(
             df_expr = df_expr.drop_duplicates(subset=["Hugo_Symbol"], keep="first")
             df_expr = df_expr.set_index("Hugo_Symbol")
 
-        common_patients = [p for p in df_clin.index if p in df_expr.columns and not pd.isna(time_days.loc[p])]
+        common_patients = [
+            p for p in df_clin.index
+            if p in df_expr.columns
+            and not pd.isna(time_days.loc[p])
+            and np.isfinite(time_days.loc[p])
+            and time_days.loc[p] > 0
+            and not pd.isna(events.loc[p])
+            and events.loc[p] in (0, 1)
+        ]
         if len(common_patients) < 50:
             raise ValueError(f"Insufficient overlapping patients in METABRIC ({len(common_patients)})")
 
@@ -238,6 +256,7 @@ def fetch_geo_gse31210(
     Fetches and harmonizes NCBI GEO GSE31210 lung adenocarcinoma cohort (226 patients).
     Extracts recurrence endpoints (days before relapse/censor, relapse status) and
     maps Affymetrix HG-U133_Plus_2 probes to official HGNC gene symbols.
+    Raises RuntimeError if network is unavailable or download fails (no silent synthetic fallback).
     """
     out_dir = out_dir or EXTERNAL_DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -281,12 +300,20 @@ def fetch_geo_gse31210(
             elif "!Sample_characteristics_ch1\t\"relapse:" in line or (
                 line.startswith("!Sample_characteristics_ch1") and "relapse:" in line and "days" not in line and "months" not in line
             ):
-                relapse_status = [1 if ("relapsed" in s and "not relapsed" not in s) else 0 for s in line.split("\t")[1:]]
+                for s in line.split("\t")[1:]:
+                    s_clean = s.strip('" ').lower()
+                    if "relapsed" in s_clean and "not relapsed" not in s_clean:
+                        relapse_status.append(1)
+                    elif "not relapsed" in s_clean:
+                        relapse_status.append(0)
+                    else:
+                        relapse_status.append(np.nan)
             elif "days before relapse/censor:" in line:
                 for s in line.split("\t")[1:]:
                     val = s.split(":")[-1].strip('" ')
                     try:
-                        relapse_days.append(float(val))
+                        f_val = float(val)
+                        relapse_days.append(f_val if np.isfinite(f_val) and f_val > 0 else np.nan)
                     except Exception:
                         relapse_days.append(np.nan)
 
@@ -309,6 +336,7 @@ def fetch_geo_gse31210(
             "relapse": relapse_status,
             "days": relapse_days[:len(relapse_status)],
         }).set_index("sample_id").loc[common].dropna()
+        clin_df = clin_df[(clin_df["days"] > 0) & np.isfinite(clin_df["days"]) & clin_df["relapse"].isin([0, 1])]
 
         X_df = df_genes[clin_df.index].T.astype(float).fillna(0.0)
         time_series = clin_df["days"].astype(float)

@@ -274,24 +274,34 @@ def is_tumor_sample(s: str) -> bool:
 
 
 def load_pancan_master_data(
-    horizon_days: int = RISK_HORIZON_DAYS
+    horizon_days: int = RISK_HORIZON_DAYS,
+    endpoint: str = "PFI",
 ) -> Optional[Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]]:
     """
     Loads pre-harmonized ComBat-adjusted PanCanAtlas master expression matrix covering all 33 TCGA cohorts
     (EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp: ~24.5 GB uncompressed text / ~3.5 GB Parquet).
+    Enforces strict survival endpoint selection (PFI vs OS) without silent fallback.
+    Applies identical patient-level deduplication (sample type prioritization), exclusion of missing/invalid
+    events and non-positive follow-up times, and strict alignment assertions as load_cohort_data().
     """
+    endpoint = endpoint.strip().upper()
+    if endpoint not in ("PFI", "OS"):
+        raise ValueError(f"Invalid survival endpoint '{endpoint}'. Must be 'PFI' or 'OS'.")
+
     shards_dir = ROOT / "data" / "processed" / "shards"
     pq_path   = shards_dir / "TCGA_PANCAN_EB_ADJUST_expression.parquet"
     tsv_path  = XENA_DIR / "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv"
     path_cdr  = XENA_DIR / "TCGA_CDR_survival.tsv"
 
     if not pq_path.exists() and not tsv_path.exists():
+        log.info("PanCanAtlas master matrix files not found on disk (%s / %s).", pq_path, tsv_path)
         return None
     if not path_cdr.exists():
+        log.info("TCGA-CDR survival matrix not found on disk (%s).", path_cdr)
         return None
 
     try:
-        log.info("  Found PanCanAtlas ComBat-adjusted Master Matrix! Loading all 33 TCGA cohorts in one flow...")
+        log.info("  Found PanCanAtlas ComBat-adjusted Master Matrix! Loading all 33 TCGA cohorts in one flow (endpoint: %s)...", endpoint)
         if pq_path.exists():
             df_expr = pd.read_parquet(pq_path).dropna(how="all").astype(np.float32)
         else:
@@ -313,51 +323,126 @@ def load_pancan_master_data(
             elif s[:12] in cdr_sample_set:
                 sample_to_cdr[s] = s[:12]
 
-        valid_samples = [
+        valid_samples_temp = [
             s for s in tumor_samples
             if s in sample_to_cdr and pd.isna(df_cdr.loc[sample_to_cdr[s], "Redaction"])
         ]
 
-        sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
-        sub_cdr.index = valid_samples
+        # Patient-level grouping and primary tumor prioritization (-01 primary over -02 recurrent, etc.)
+        patient_sample_map: Dict[str, List[str]] = {}
+        for s in valid_samples_temp:
+            pt_id = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
+            patient_sample_map.setdefault(pt_id, []).append(s)
 
-        if "PFI" in sub_cdr.columns and sub_cdr["PFI"].notna().sum() > 0:
-            event_series = sub_cdr["PFI"].fillna(0).astype(int)
-            time_series  = sub_cdr["PFI.time"].fillna(0).astype(float)
-        else:
-            event_series = sub_cdr["OS"].fillna(0).astype(int)
-            time_series  = sub_cdr["OS.time"].fillna(0).astype(float)
+        deduplicated_samples = []
+        duplicate_samples_excluded = 0
+        for pt_id, s_list in patient_sample_map.items():
+            if len(s_list) == 1:
+                deduplicated_samples.append(s_list[0])
+            else:
+                duplicate_samples_excluded += (len(s_list) - 1)
+                # Prioritize primary solid tumor (-01), then recurrent (-02), etc.
+                def _sample_type_sort_key(barcode: str) -> int:
+                    parts = barcode.split("-")
+                    if len(parts) >= 4 and len(parts[3]) >= 2:
+                        stype = parts[3][:2]
+                        if stype.isdigit():
+                            return int(stype)
+                    return 99
+                sorted_s = sorted(s_list, key=_sample_type_sort_key)
+                deduplicated_samples.append(sorted_s[0])
+
+        sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in deduplicated_samples]].copy()
+        sub_cdr.index = deduplicated_samples
+
+        # Strict PFI vs OS endpoint extraction (NO SILENT FALLBACK)
+        if endpoint == "PFI":
+            if "PFI" not in sub_cdr.columns or "PFI.time" not in sub_cdr.columns:
+                log.warning("PFI or PFI.time not in TCGA-CDR. Silent fallback to OS is prohibited.")
+                return None
+            event_col = "PFI"
+            time_col = "PFI.time"
+        elif endpoint == "OS":
+            if "OS" not in sub_cdr.columns or "OS.time" not in sub_cdr.columns:
+                log.warning("OS or OS.time not in TCGA-CDR. Silent fallback to PFI is prohibited.")
+                return None
+            event_col = "OS"
+            time_col = "OS.time"
+
+        # Explicitly exclude missing events (no fillna(0)) and non-positive / non-finite follow-up times
+        raw_events = pd.to_numeric(sub_cdr[event_col], errors="coerce")
+        raw_times = pd.to_numeric(sub_cdr[time_col], errors="coerce")
+
+        valid_endpoint_mask = (
+            raw_events.notna() &
+            raw_events.isin([0, 1]) &
+            raw_times.notna() &
+            np.isfinite(raw_times) &
+            (raw_times > 0)
+        )
+        final_samples = [s for s in deduplicated_samples if valid_endpoint_mask.loc[s]]
+
+        if len(final_samples) < 50:
+            log.warning("Insufficient valid endpoint samples in PanCanAtlas master matrix (%d < 50).", len(final_samples))
+            return None
+
+        event_series = raw_events.loc[final_samples].astype(int)
+        time_series = raw_times.loc[final_samples].astype(float)
 
         is_high_risk = (event_series == 1) & (time_series <= horizon_days)
         is_low_risk  = (time_series >= horizon_days)
         landmark_mask = is_high_risk | is_low_risk
-        eval_samples  = [s for s in valid_samples if landmark_mask.loc[s]]
+        eval_samples  = [s for s in final_samples if landmark_mask.loc[s]]
 
         if len(eval_samples) < 50:
-            log.warning("Insufficient valid landmark samples in PanCanAtlas master matrix.")
+            log.warning("Insufficient valid landmark samples in PanCanAtlas master matrix (%d < 50).", len(eval_samples))
             return None
 
         y_series = pd.Series(0, index=eval_samples, dtype=int)
         y_series.loc[[s for s in eval_samples if is_high_risk.loc[s]]] = 1
+        time_eval = time_series.loc[eval_samples]
+        event_eval = event_series.loc[eval_samples]
 
         X = df_expr[eval_samples].T.fillna(0.0).astype(np.float32)
         del df_expr
         import gc; gc.collect()
 
-        log.info("  Unified PanCanAtlas Master Matrix Loaded: %d patients (%d High Risk / %d Low Risk at %d days)",
-                 len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days)
-        return X, y_series, time_series.loc[eval_samples], event_series.loc[eval_samples]
+        # Strict alignment assertions
+        assert (X.index == y_series.index).all(), "PanCan master expression index and label index misaligned"
+        assert (X.index == time_eval.index).all(), "PanCan master expression index and time index misaligned"
+        assert (X.index == event_eval.index).all(), "PanCan master expression index and event index misaligned"
+        assert not event_eval.isna().any(), "PanCan master loader contains NaN events"
+        assert (time_eval > 0).all(), "PanCan master loader contains non-positive follow-up times"
+        assert set(event_eval.unique()).issubset({0, 1}), "PanCan master loader events not in {0, 1}"
+
+        log.info(
+            "  Unified PanCanAtlas Master Matrix Loaded: %d patients (%d High Risk / %d Low Risk at %d days, %d duplicate biospecimens excluded)",
+            len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days, duplicate_samples_excluded
+        )
+        return X, y_series, time_eval, event_eval
     except Exception as e:
         log.warning("Failed loading PanCanAtlas master matrix (%s). Falling back to individual cohorts.", e)
         return None
 
 
-def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+def load_cohort_data(
+    cancer: str,
+    horizon_days: int = RISK_HORIZON_DAYS,
+    endpoint: str = "PFI",
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     Loads RNA-Seq expression and standardized TCGA-CDR clinical outcomes for a cohort.
+    Enforces strict survival endpoint selection (PFI vs OS) without silent fallback.
+    Performs patient-level barcode mapping, deduplication of multiple biospecimens per patient,
+    and rigorous exclusion tracking.
+
     Returns:
       (expression_df, binary_risk_labels, time_series, event_series)
     """
+    endpoint = endpoint.strip().upper()
+    if endpoint not in ("PFI", "OS"):
+        raise ValueError(f"Invalid survival endpoint '{endpoint}'. Must be 'PFI' or 'OS'.")
+
     cancer = normalize_cancer_code(cancer)
     fname_expr = XENA_FILE.get(cancer, get_xena_tsv_name(cancer))
     path_expr = XENA_DIR / fname_expr
@@ -389,6 +474,9 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     if not tumor_samples:
         tumor_samples = [c for c in df_expr.columns if c not in ("sample", "_PATIENT")]
 
+    total_genomic_samples = len(df_expr.columns)
+    normal_samples_excluded = total_genomic_samples - len(tumor_samples)
+
     # Restrict to samples present in TCGA-CDR and without redaction flags
     # Map exact barcode (15-char), vial barcode (16-char), or patient barcode (12-char)
     cdr_sample_set = set(df_cdr.index)
@@ -401,25 +489,100 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
         elif s[:12] in cdr_sample_set:
             sample_to_cdr[s] = s[:12]
 
-    valid_samples = [
-        s for s in tumor_samples
-        if s in sample_to_cdr and pd.isna(df_cdr.loc[sample_to_cdr[s], "Redaction"])
-    ]
+    missing_cdr_excluded = len(tumor_samples) - len(sample_to_cdr)
+    redacted_excluded = 0
+    valid_samples_temp = []
+    for s in tumor_samples:
+        if s in sample_to_cdr:
+            cdr_key = sample_to_cdr[s]
+            if pd.notna(df_cdr.loc[cdr_key, "Redaction"]):
+                redacted_excluded += 1
+            else:
+                valid_samples_temp.append(s)
 
-    sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in valid_samples]].copy()
-    sub_cdr.index = valid_samples
+    # Patient-level grouping and primary tumor prioritization (-01 over -02, etc.)
+    # Group samples by 12-char patient ID to prevent duplicate patient biospecimens across splits
+    patient_sample_map: Dict[str, List[str]] = {}
+    for s in valid_samples_temp:
+        pt_id = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
+        patient_sample_map.setdefault(pt_id, []).append(s)
 
-    # Primary survival endpoint: Progression-Free Interval (PFI)
-    # Fallback to Overall Survival (OS) if PFI is absent
-    if "PFI" in sub_cdr.columns and sub_cdr["PFI"].notna().sum() > 0:
-        event_series = sub_cdr["PFI"].fillna(0).astype(int)
-        time_series  = sub_cdr["PFI.time"].fillna(0).astype(float)
-    else:
-        event_series = sub_cdr["OS"].fillna(0).astype(int)
-        time_series  = sub_cdr["OS.time"].fillna(0).astype(float)
+    deduplicated_samples = []
+    duplicate_samples_excluded = 0
+    for pt_id, s_list in patient_sample_map.items():
+        if len(s_list) == 1:
+            deduplicated_samples.append(s_list[0])
+        else:
+            duplicate_samples_excluded += (len(s_list) - 1)
+            # Prioritize primary solid tumor (sample type 01)
+            primary_samples = [s for s in s_list if "-01" in s]
+            if primary_samples:
+                deduplicated_samples.append(sorted(primary_samples)[0])
+            else:
+                deduplicated_samples.append(sorted(s_list)[0])
+
+    sub_cdr = df_cdr.loc[[sample_to_cdr[s] for s in deduplicated_samples]].copy()
+    sub_cdr.index = deduplicated_samples
+
+    # Survival endpoint extraction: STRICT PFI vs OS (NO SILENT FALLBACK)
+    if endpoint == "PFI":
+        if "PFI" not in sub_cdr.columns or "PFI.time" not in sub_cdr.columns:
+            raise ValueError(
+                f"Cohort TCGA-{cancer} lacks 'PFI' or 'PFI.time' in TCGA-CDR table. Silent fallback to OS is prohibited."
+            )
+        event_col = "PFI"
+        time_col = "PFI.time"
+    elif endpoint == "OS":
+        if "OS" not in sub_cdr.columns or "OS.time" not in sub_cdr.columns:
+            raise ValueError(
+                f"Cohort TCGA-{cancer} lacks 'OS' or 'OS.time' in TCGA-CDR table. Silent fallback to PFI is prohibited."
+            )
+        event_col = "OS"
+        time_col = "OS.time"
+
+    # Exclude patients with missing or non-positive follow-up time
+    # Strictly require event in {0, 1} and time > 0 (prohibit silent conversion of NaN to censored)
+    raw_cohort_events = pd.to_numeric(sub_cdr[event_col], errors="coerce")
+    raw_cohort_times = pd.to_numeric(sub_cdr[time_col], errors="coerce")
+    valid_endpoint_mask = (
+        raw_cohort_events.notna() &
+        raw_cohort_events.isin([0, 1]) &
+        raw_cohort_times.notna() &
+        np.isfinite(raw_cohort_times) &
+        (raw_cohort_times > 0)
+    )
+    missing_followup_excluded = int((~valid_endpoint_mask).sum())
+    final_samples = [s for s in deduplicated_samples if valid_endpoint_mask.loc[s]]
+
+    if len(final_samples) == 0:
+        raise ValueError(
+            f"Cohort TCGA-{cancer} is unevaluable for endpoint '{endpoint}': 0 patients with valid follow-up."
+        )
+
+    event_series = raw_cohort_events.loc[final_samples].astype(int)
+    time_series = raw_cohort_times.loc[final_samples].astype(float)
+
+    n_events = int(event_series.sum())
+    n_total = len(final_samples)
+    censored_count = n_total - n_events
+    censoring_rate = round(float(censored_count / max(n_total, 1)), 4)
+
+    if n_events < 5:
+        log.warning(
+            "Cohort TCGA-%s is unevaluable for endpoint '%s': observed events %d < 5 minimum threshold. "
+            "Silent substitution of alternate endpoints is strictly prohibited.",
+            cancer, endpoint, n_events
+        )
+
+    log.info(
+        "  [COHORT AUDIT - TCGA-%s | %s] Total: %d patients, Events: %d, Censored: %d (%.1f%%). "
+        "Exclusions: Normal=%d, Missing CDR=%d, Redacted=%d, Duplicate biospecimens=%d, Invalid follow-up=%d.",
+        cancer, endpoint, n_total, n_events, censored_count, censoring_rate * 100,
+        normal_samples_excluded, missing_cdr_excluded, redacted_excluded, duplicate_samples_excluded, missing_followup_excluded
+    )
 
     # Define landmark Recurrence Risk based on parameterized horizon
-    # High-Risk (1): Confirmed progression within horizon (PFI == 1 and time <= horizon_days)
+    # High-Risk (1): Confirmed progression within horizon (event == 1 and time <= horizon_days)
     # Low-Risk  (0): Confirmed progression-free for at least horizon_days (time >= horizon_days)
     # Early-Censored: Patients without event censored before horizon (time < horizon_days and event == 0)
     is_high_risk = (event_series == 1) & (time_series <= horizon_days)
@@ -428,12 +591,12 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     # Definitive landmark cohort for binary risk evaluation
     # (Continuous survival concordance evaluates all patients)
     landmark_mask = is_high_risk | is_low_risk
-    eval_samples  = [s for s in valid_samples if landmark_mask.loc[s]]
+    eval_samples  = [s for s in final_samples if landmark_mask.loc[s]]
 
     # If landmark samples are too few, retain all patients using median survival split
     if len(eval_samples) < 15:
         log.warning("Cohort %s has limited %d-day follow-up (%d samples). Using full cohort.", cancer, horizon_days, len(eval_samples))
-        eval_samples = valid_samples
+        eval_samples = final_samples
         y_series = event_series.loc[eval_samples]
     else:
         y_series = pd.Series([1 if is_high_risk.loc[s] else 0 for s in eval_samples], index=eval_samples)
@@ -442,10 +605,162 @@ def load_cohort_data(cancer: str, horizon_days: int = RISK_HORIZON_DAYS) -> Tupl
     del df_expr
     import gc; gc.collect()
 
+    t_eval = time_series.loc[eval_samples]
+    e_eval = event_series.loc[eval_samples]
+
+    # Strict alignment assertions
+    assert (X.index == y_series.index).all(), f"Cohort TCGA-{cancer} expression index and label index misaligned"
+    assert (X.index == t_eval.index).all(), f"Cohort TCGA-{cancer} expression index and time index misaligned"
+    assert (X.index == e_eval.index).all(), f"Cohort TCGA-{cancer} expression index and event index misaligned"
+    assert not e_eval.isna().any(), f"Cohort TCGA-{cancer} contains NaN events"
+    assert (t_eval > 0).all(), f"Cohort TCGA-{cancer} contains non-positive follow-up times"
+    assert set(e_eval.unique()).issubset({0, 1}), f"Cohort TCGA-{cancer} events not in {0, 1}"
+
     log.info("  Cohort TCGA-%s: %d total tumor samples -> %d landmark patients (%d High Risk / %d Low Risk at %d days)",
              cancer, len(tumor_samples), len(eval_samples), int((y_series == 1).sum()), int((y_series == 0).sum()), horizon_days)
 
-    return X, y_series, time_series.loc[eval_samples], event_series.loc[eval_samples]
+    return X, y_series, t_eval, e_eval
+
+
+def load_cohort_methylation(
+    cancer: str,
+    target_samples: List[str],
+    max_probes: int = 100,
+) -> Optional[pd.DataFrame]:
+    """
+    Loads TCGA HumanMethylation450 array for a cohort using streaming chunked execution
+    (< 200 MB RAM footprint), aligns to target sample barcodes (12-char patient IDs or exact barcodes),
+    selects top-variance CpG probes, and returns an aligned DataFrame of shape
+    (len(target_samples), max_probes) with 'METH_' prefix.
+    """
+    import heapq
+
+    cancer = normalize_cancer_code(cancer)
+    shards_dir = ROOT / "data" / "processed" / "shards"
+    pq_path = shards_dir / f"TCGA_{cancer}_methylation.parquet"
+    tsv_path = XENA_DIR / f"TCGA.{cancer}.sampleMap_HumanMethylation450.tsv"
+
+    if not pq_path.exists() and not tsv_path.exists():
+        return None
+
+    try:
+        log.info("  Loading HumanMethylation450 multi-omics array for TCGA-%s...", cancer)
+
+        # 1. Inspect header to identify available sample columns without full loading
+        if pq_path.exists():
+            try:
+                import pyarrow.parquet as pq
+                all_cols = pq.ParquetFile(pq_path).schema.names
+                meth_cols = [c for c in all_cols if not c.startswith("__index") and c not in ("sample", "index")]
+                index_col_name = "sample" if "sample" in all_cols else None
+            except Exception:
+                df_header = pd.read_parquet(pq_path, columns=[]).dropna(how="all")
+                meth_cols = list(df_header.columns)
+                index_col_name = None
+        else:
+            with open(tsv_path, "r", encoding="utf-8", errors="replace") as f:
+                header_line = f.readline()
+            header_parts = header_line.rstrip("\r\n").split("\t")
+            index_col_name = header_parts[0]
+            meth_cols = header_parts[1:]
+
+        meth_col_set = set(meth_cols)
+        patient_to_meth_col: Dict[str, str] = {}
+        for c in meth_cols:
+            pt = c[:12] if c.startswith("TCGA-") and len(c) >= 12 else c
+            if pt not in patient_to_meth_col or "-01" in c:
+                patient_to_meth_col[pt] = c
+
+        matched_meth_cols = []
+        for s in target_samples:
+            if s in meth_col_set:
+                matched_meth_cols.append(s)
+            else:
+                pt = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
+                if pt in patient_to_meth_col:
+                    matched_meth_cols.append(patient_to_meth_col[pt])
+
+        matched_unique = list(dict.fromkeys(matched_meth_cols))
+        if len(matched_unique) < 10:
+            log.warning("Cohort TCGA-%s has insufficient matched methylation samples (%d < 10).", cancer, len(matched_unique))
+            return None
+
+        # 2. Extract top variance probes
+        if pq_path.exists():
+            df_sub = pd.read_parquet(pq_path, columns=matched_unique).dropna(how="all").astype(np.float32)
+            variances = df_sub.var(axis=1)
+            top_probes = variances.nlargest(max_probes).index
+            df_probes = df_sub.loc[top_probes]
+
+            aligned_rows = []
+            for s in target_samples:
+                col = s if s in meth_col_set else patient_to_meth_col.get(s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s)
+                if col and col in df_probes.columns:
+                    aligned_rows.append(df_probes[col].values)
+                else:
+                    aligned_rows.append(df_probes.mean(axis=1).values)
+
+            df_aligned = pd.DataFrame(
+                aligned_rows,
+                index=target_samples,
+                columns=[f"METH_{p}" for p in top_probes],
+                dtype=np.float32,
+            )
+        else:
+            # TSV streaming chunked reader (< 150 MB RAM even for 3.5 GB BRCA)
+            cols_to_use = [index_col_name] + matched_unique
+            chunk_size = 25000
+            top_heap: List[Tuple[float, str, Dict[str, float]]] = []
+
+            for df_chunk in pd.read_csv(tsv_path, sep="\t", usecols=cols_to_use, index_col=index_col_name,
+                                        chunksize=chunk_size, low_memory=False):
+                df_chunk = df_chunk.dropna(how="all").astype(np.float32)
+                vars_chunk = df_chunk.var(axis=1)
+                n_cand = min(max_probes, len(vars_chunk))
+                top_cand = vars_chunk.nlargest(n_cand)
+                for probe_id, var_val in top_cand.items():
+                    if np.isnan(var_val):
+                        continue
+                    row_vals = df_chunk.loc[probe_id].to_dict()
+                    if len(top_heap) < max_probes:
+                        heapq.heappush(top_heap, (float(var_val), str(probe_id), row_vals))
+                    elif var_val > top_heap[0][0]:
+                        heapq.heapreplace(top_heap, (float(var_val), str(probe_id), row_vals))
+
+            if not top_heap:
+                log.warning("Cohort TCGA-%s yielded 0 valid methylation probes.", cancer)
+                return None
+
+            sorted_probes = sorted(top_heap, key=lambda x: x[0], reverse=True)
+            top_probe_names = [x[1] for x in sorted_probes]
+            probe_dict_map = {x[1]: x[2] for x in sorted_probes}
+
+            aligned_rows = []
+            for s in target_samples:
+                col = s if s in meth_col_set else patient_to_meth_col.get(s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s)
+                row_data = []
+                for p in top_probe_names:
+                    p_map = probe_dict_map[p]
+                    if col and col in p_map and not np.isnan(p_map[col]):
+                        row_data.append(p_map[col])
+                    else:
+                        valid_vals = [v for v in p_map.values() if not np.isnan(v)]
+                        row_data.append(float(np.mean(valid_vals)) if valid_vals else 0.5)
+                aligned_rows.append(row_data)
+
+            df_aligned = pd.DataFrame(
+                aligned_rows,
+                index=target_samples,
+                columns=[f"METH_{p}" for p in top_probe_names],
+                dtype=np.float32,
+            )
+
+        log.info("  [MULTI-OMICS] Aligned %d methylation CpG probes for %d TCGA-%s samples (Streaming O(1) Memory).",
+                 df_aligned.shape[1], len(target_samples), cancer)
+        return df_aligned
+    except Exception as exc:
+        log.warning("Could not process methylation for TCGA-%s: %s", cancer, exc)
+        return None
 
 
 def clean_matrix_axes(
@@ -490,12 +805,21 @@ def extract_unified_cohort(
     cohort_name: str,
     horizon_days: int = RISK_HORIZON_DAYS,
     normalize_batches: bool = False,
-    include_external: bool = False
-) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
+    include_external: bool = False,
+    include_methylation: bool = False,
+    max_meth_probes: int = 100,
+    endpoint: str = "PFI",
+    return_provenance: bool = False,
+) -> Union[
+    Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray],
+    Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]],
+]:
     """
-    Loads and unifies single or pan-organ multi-cancer cohorts.
+    Loads and unifies single or pan-organ multi-cancer cohorts for specified endpoint (PFI or OS).
+    Supports multi-omics integration of HumanMethylation450 CpG arrays via include_methylation.
     NOTE: include_external is strictly False by default to prevent external validation contamination
     (METABRIC and GSE31210 must remain completely isolated as true external hospital test sets).
+    Tracks explicit data provenance and fallback status.
     """
     is_global_all = cohort_name.upper() in ("PAN-CANCER-ALL", "ALL", "GLOBAL", "ALL-CONSOLIDATED")
     all_X = []
@@ -503,33 +827,52 @@ def extract_unified_cohort(
     all_time = []
     all_event = []
 
-    # Priority 1: If training PAN-CANCER-ALL, check for unified PanCanAtlas ComBat master matrix
+    # Priority 1: If training PAN-CANCER-ALL without methylation, check for unified PanCanAtlas ComBat master matrix
     loaded_master = False
-    if is_global_all:
-        master_data = load_pancan_master_data(horizon_days=horizon_days)
-        if master_data is not None:
-            X_m, y_m, t_m, e_m = master_data
-            X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
-            all_X.append(X_m)
-            all_y.append(y_m)
-            all_time.append(t_m)
-            all_event.append(e_m)
-            loaded_master = True
+    master_fallback_reason = None
+    if is_global_all and not include_methylation:
+        try:
+            master_data = load_pancan_master_data(horizon_days=horizon_days, endpoint=endpoint)
+            if master_data is not None:
+                X_m, y_m, t_m, e_m = master_data
+                X_m, y_m, t_m, e_m = clean_matrix_axes(X_m, y_m, t_m, e_m, prefix="TCGA_PANCAN")
+                all_X.append(X_m)
+                all_y.append(y_m)
+                all_time.append(t_m)
+                all_event.append(e_m)
+                loaded_master = True
+            else:
+                master_fallback_reason = "Master matrix files not found on disk or insufficient landmark samples (<50)"
+        except Exception as exc:
+            master_fallback_reason = f"Exception loading master matrix: {str(exc)}"
+            log.warning("Master matrix failed: %s", exc)
 
-    # Priority 2: Ingest individual organ cohorts if master matrix not loaded
+    # Priority 2: Ingest individual organ cohorts if master matrix not loaded or multi-omics requested
     if not loaded_master:
+        if is_global_all:
+            if include_methylation:
+                log.info("  [MULTI-OMICS] Activating cohort-by-cohort ingestion for multi-omics epigenetic integration.")
+            else:
+                log.info(
+                    "  [PROVENANCE] Fallback to individual cohort aggregation activated (Reason: %s)",
+                    master_fallback_reason
+                )
         cancer_codes = ALL_TCGA_COHORTS if is_global_all else COHORT_GROUPS.get(cohort_name, [cohort_name])
         for c in cancer_codes:
-            log.info("  Loading clinical genomics for: TCGA-%s...", c)
+            log.info("  Loading clinical genomics for: TCGA-%s (endpoint: %s)...", c, endpoint)
             try:
-                X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days)
+                X_sub, y_sub, t_sub, e_sub = load_cohort_data(c, horizon_days=horizon_days, endpoint=endpoint)
+                if include_methylation:
+                    df_meth = load_cohort_methylation(c, target_samples=list(X_sub.index), max_probes=max_meth_probes)
+                    if df_meth is not None:
+                        X_sub = pd.concat([X_sub, df_meth], axis=1)
                 X_sub, y_sub, t_sub, e_sub = clean_matrix_axes(X_sub, y_sub, t_sub, e_sub, prefix=f"TCGA_{c}")
                 all_X.append(X_sub)
                 all_y.append(y_sub)
                 all_time.append(t_sub)
                 all_event.append(e_sub)
             except Exception as exc:
-                log.warning("Could not ingest cohort TCGA-%s: %s", c, exc)
+                log.warning("Could not ingest cohort TCGA-%s for endpoint %s: %s", c, endpoint, exc)
 
     # Ingest external independent cohorts ONLY when explicitly requested for joint multi-consortium training
     if include_external:
@@ -613,8 +956,31 @@ def extract_unified_cohort(
     times = np.concatenate([t_s.values for t_s in all_time]).astype(np.float32)
     events = np.concatenate([e_s.values for e_s in all_event]).astype(np.int32)
 
-    log.info("  Unified %s Single-Flow Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors)",
-             cohort_name, len(y), int((y == 1).sum()), int((y == 0).sum()))
+    if loaded_master:
+        data_provenance = "pancan_master_combat_matrix"
+        master_matrix_fallback = False
+        master_fallback_reason = None
+    elif is_global_all:
+        data_provenance = "individual_cohort_aggregation_fallback"
+        master_matrix_fallback = True
+        master_fallback_reason = master_fallback_reason or "PanCan master matrix not loaded"
+    else:
+        data_provenance = f"individual_cohort_{cohort_name}"
+        master_matrix_fallback = False
+        master_fallback_reason = None
+
+    provenance_info = {
+        "data_provenance": data_provenance,
+        "master_matrix_fallback": master_matrix_fallback,
+        "master_fallback_reason": master_fallback_reason,
+        "multi_omics": include_methylation,
+    }
+
+    log.info("  Unified %s Single-Flow Cohort: %d total patients (%d High Risk Events / %d Low Risk Survivors) | Provenance: %s",
+             cohort_name, len(y), int((y == 1).sum()), int((y == 0).sum()), data_provenance)
+
+    if return_provenance:
+        return X_df, y, times, events, provenance_info
     return X_df, y, times, events
 
 
@@ -670,23 +1036,39 @@ def train_strong_risk_model(
     cohort_name: str,
     n_indiv_genes: int = DEFAULT_N_GENES,
     horizon_days: int = RISK_HORIZON_DAYS,
-    epochs: int = 60,
+    epochs: int = 100,
     seed: int = DEFAULT_RANDOM_SEED,
     normalize_batches: bool = False,
-    include_external: bool = False
+    include_external: bool = False,
+    include_methylation: bool = False,
+    max_meth_probes: int = 100,
+    endpoint: str = "PFI",
 ) -> Dict[str, Any]:
+    endpoint = endpoint.strip().upper()
+    if endpoint not in ("PFI", "OS"):
+        raise ValueError(f"Invalid survival endpoint '{endpoint}'. Must be 'PFI' or 'OS'.")
+
     horizon_years = max(1, round(horizon_days / 365.25))
-    time_horizon_str = f"{horizon_years}-Year Progression & Recurrence Risk"
+    time_horizon_str = f"{horizon_years}-Year Progression & Recurrence Risk ({endpoint})"
 
     log.info("=" * 76)
     log.info(" TRAINING CLINICAL RISK ENGINE (STACKING ENSEMBLE): %s", cohort_name)
-    log.info(" Target: %s (Horizon: %d days | Epochs: %d)", time_horizon_str, horizon_days, epochs)
+    log.info(" Target: %s (Horizon: %d days | Epochs: %d | Endpoint: %s)", time_horizon_str, horizon_days, epochs, endpoint)
     log.info(" Single-Flow Multi-Consortium Optimization (Zero Piecewise Batches)")
+    if include_methylation:
+        log.info(" Multi-Omics Epigenetic Integration: Active (HumanMethylation450 CpG Arrays)")
     log.info("=" * 76)
 
     # 1. Load Raw Patient Expression and Clinical Outcomes
-    X_raw_df, y, times, events = extract_unified_cohort(
-        cohort_name, horizon_days=horizon_days, normalize_batches=normalize_batches, include_external=include_external
+    X_raw_df, y, times, events, provenance = extract_unified_cohort(
+        cohort_name,
+        horizon_days=horizon_days,
+        normalize_batches=normalize_batches,
+        include_external=include_external,
+        include_methylation=include_methylation,
+        max_meth_probes=max_meth_probes,
+        endpoint=endpoint,
+        return_provenance=True,
     )
 
     # 2. Stratified 80/20 Partition
@@ -709,7 +1091,7 @@ def train_strong_risk_model(
     X_tr = X_tr_df.values.astype(np.float32)
     X_te = X_te_df.values.astype(np.float32)
 
-    # 4. Feature Selection: Top Individual Genes + Hallmark Metagenes
+    # 4. Feature Selection: Top Individual Genes + Hallmark Metagenes + Multi-Omics Epigenetic Markers
     log.info("  Selecting top %d individual prognostic genes + %d pathway metagenes...", n_indiv_genes, len(meta_names))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", (UserWarning, RuntimeWarning))
@@ -719,14 +1101,23 @@ def train_strong_risk_model(
     # Prioritize genes with universal cross-cohort coverage to prevent cross-platform feature dropout
     nonzero_frac = np.mean(X_tr != 0.0, axis=0)
     meta_indices = [raw_feature_names.index(m) for m in meta_names if m in raw_feature_names]
-    sorted_candidates = [i for i in np.argsort(f_scores)[::-1] if i not in meta_indices]
+    meth_indices = [i for i, name in enumerate(raw_feature_names) if name.startswith("METH_")]
+    sorted_candidates = [i for i in np.argsort(f_scores)[::-1] if i not in meta_indices and i not in meth_indices]
     high_cov_candidates = [i for i in sorted_candidates if nonzero_frac[i] >= 0.65]
     if len(high_cov_candidates) >= n_indiv_genes:
         top_indiv_indices = high_cov_candidates[:n_indiv_genes]
     else:
         top_indiv_indices = sorted_candidates[:n_indiv_genes]
 
-    selected_indices = meta_indices + top_indiv_indices
+    # If multi-omics methylation is present, select top epigenetic CpG probes by F-score
+    selected_meth_indices = []
+    if meth_indices:
+        sorted_meth = sorted(meth_indices, key=lambda idx: f_scores[idx], reverse=True)
+        top_meth_count = min(30, len(sorted_meth))
+        selected_meth_indices = sorted_meth[:top_meth_count]
+        log.info("  [MULTI-OMICS] Retained top %d epigenetic CpG methylation markers by univariate F-score.", len(selected_meth_indices))
+
+    selected_indices = meta_indices + selected_meth_indices + top_indiv_indices
     selected_features = [raw_feature_names[i] for i in selected_indices]
     top_indiv_genes = [raw_feature_names[i] for i in top_indiv_indices]
 
@@ -757,17 +1148,42 @@ def train_strong_risk_model(
     # 7. Construct Multi-Model Stacking Ensemble with Multi-Epoch Optimization
     xgb_estimators = max(180, epochs * 4)
     elastic_iter = max(4000, epochs * 80)
-    log.info("  Configuring Stacking Ensemble (ElasticNet [%d passes] + XGBoost [%d boosting rounds, scale_pos=%.2f] + ExtraTrees)...",
-             elastic_iter, xgb_estimators, scale_pos_weight)
+    xgb_lr = 0.025 if epochs >= 80 else 0.03
+    xgb_device = "cpu"
+    if TORCH_AVAILABLE:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                xgb_device = "cuda"
+        except Exception:
+            pass
+
+    log.info(
+        "  Configuring Stacking Ensemble (ElasticNet [%d passes] + XGBoost [%d boosting rounds, lr=%.3f, device=%s] + ExtraTrees)...",
+        elastic_iter, xgb_estimators, xgb_lr, xgb_device
+    )
+
+    xgb_kwargs = {
+        "n_estimators": xgb_estimators,
+        "max_depth": 3,
+        "learning_rate": xgb_lr,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "reg_lambda": 4.0,
+        "reg_alpha": 0.5,
+        "scale_pos_weight": scale_pos_weight,
+        "random_state": seed,
+        "verbosity": 0,
+        "tree_method": "hist",
+    }
+    if xgb_device == "cuda":
+        xgb_kwargs["device"] = "cuda"
+
     base_models = [
         ("elasticnet", LogisticRegression(
             penalty="elasticnet", solver="saga", l1_ratio=0.5, C=0.3, max_iter=elastic_iter, random_state=seed
         )),
-        ("xgboost", XGBClassifier(
-            n_estimators=xgb_estimators, max_depth=3, learning_rate=0.03, subsample=0.8,
-            colsample_bytree=0.7, reg_lambda=4.0, reg_alpha=0.5,
-            scale_pos_weight=scale_pos_weight, random_state=seed, verbosity=0
-        )),
+        ("xgboost", XGBClassifier(**xgb_kwargs)),
         ("extratrees", ExtraTreesClassifier(
             n_estimators=150, max_depth=4, min_samples_split=4, bootstrap=True, random_state=seed
         )),
@@ -847,8 +1263,13 @@ def train_strong_risk_model(
             "n_low_risk"   : int((y == 0).sum()),
             "n_features"   : len(selected_features),
             "architecture" : "StackingEnsemble(ElasticNet + XGBoost + ExtraTrees)",
-            "endpoint"     : "TCGA-CDR PFI / OS",
+            "endpoint"     : f"TCGA-CDR {endpoint}",
             "ipcw_weighted": True,
+            "data_provenance": provenance["data_provenance"],
+            "master_matrix_fallback": provenance["master_matrix_fallback"],
+            "master_fallback_reason": provenance["master_fallback_reason"],
+            "multi_omics"  : include_methylation or len(selected_meth_indices) > 0,
+            "methylation_probes_count": len(selected_meth_indices),
             "trained_at"   : datetime.datetime.now().isoformat(),
         }
     }
@@ -864,7 +1285,12 @@ def train_strong_risk_model(
         "time_horizon"     : time_horizon_str,
         "horizon_days"     : horizon_days,
         "architecture"     : "StackingEnsemble(ElasticNet + XGBoost + ExtraTrees)",
-        "endpoint"         : "TCGA-CDR PFI (Progression-Free Interval)",
+        "endpoint"         : f"TCGA-CDR {endpoint}",
+        "data_provenance"  : provenance["data_provenance"],
+        "master_matrix_fallback": provenance["master_matrix_fallback"],
+        "master_fallback_reason": provenance["master_fallback_reason"],
+        "multi_omics"      : include_methylation or len(selected_meth_indices) > 0,
+        "methylation_probes_count": len(selected_meth_indices),
         "n_samples"        : len(y),
         "n_high_risk"      : int((y == 1).sum()),
         "n_low_risk"       : int((y == 0).sum()),
@@ -882,19 +1308,45 @@ def train_strong_risk_model(
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Omics Disease Risk Engine (StacK-Risk)")
-    parser.add_argument("cohorts", nargs="*", default=["PAN-CANCER-ALL"], help="Cohort names (e.g. PAN-CANCER-ALL PAN-RENAL all)")
-    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs for deep neural & iterative estimators")
+    parser.add_argument("cohorts", nargs="*", default=["PAN-CANCER-ALL"], help="Cohort names (e.g. PAN-CANCER-ALL PAN-RENAL ALL-MODELS)")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs for deep neural & iterative estimators (default: 100)")
     parser.add_argument("--horizon", type=int, default=RISK_HORIZON_DAYS, help="Landmark recurrence horizon in days (e.g. 365, 1095, 1825)")
     parser.add_argument("--n-genes", type=int, default=DEFAULT_N_GENES, help="Number of individual genes")
+    parser.add_argument("--endpoint", type=str, default="PFI", choices=["PFI", "OS"], help="Standardized TCGA-CDR survival endpoint: 'PFI' or 'OS'")
     parser.add_argument("--no-batch-norm", action="store_true", help="Disable batch normalization for pan-organ cohorts")
-    parser.add_argument("--exclude-external", action="store_true", help="Exclude external independent cohorts from consolidated training")
+    parser.add_argument("--include-external", action="store_true", help="Include external independent cohorts (METABRIC, GSE31210) in training")
+    parser.add_argument("--methylation", action="store_true", help="Enable multi-omics integration: incorporate HumanMethylation450 epigenetic CpG arrays")
+    parser.add_argument("--max-meth-probes", type=int, default=100, help="Maximum number of top-variance methylation CpG probes to extract (default: 100)")
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed")
     args = parser.parse_args()
 
-    cohorts = args.cohorts
-    # When user requests 'all', run the consolidated single-flow pan-cancer training across all 33 cohorts + external
-    if "all" in [c.lower() for c in cohorts]:
-        cohorts = ["PAN-CANCER-ALL"]
+    expanded_cohorts = []
+    for c in args.cohorts:
+        c_upper = c.upper()
+        if c_upper in ("ALL-MODELS", "PAN-ALL", "PAN-ALL-MODELS"):
+            expanded_cohorts.extend([
+                "PAN-CANCER-ALL",
+                "PAN-RENAL",
+                "PAN-LUNG",
+                "PAN-GI",
+                "PAN-BREAST",
+                "PAN-GYN",
+                "PAN-UROLOGICAL",
+                "PAN-HEPATOBILIARY",
+                "PAN-BRAIN",
+                "PAN-HEADNECK",
+                "PAN-ENDOCRINE",
+                "PAN-MELANOMA",
+                "PAN-SARCOMA",
+                "PAN-HEMATOLOGIC",
+            ])
+        elif c.lower() == "all":
+            expanded_cohorts.append("PAN-CANCER-ALL")
+        else:
+            expanded_cohorts.append(c_upper)
+
+    seen = set()
+    cohorts = [c for c in expanded_cohorts if not (c in seen or seen.add(c))]
 
     for c in cohorts:
         try:
@@ -904,7 +1356,10 @@ def main():
                 horizon_days=args.horizon,
                 epochs=args.epochs,
                 normalize_batches=not args.no_batch_norm,
-                include_external=not args.exclude_external,
+                include_external=args.include_external,
+                include_methylation=args.methylation,
+                max_meth_probes=args.max_meth_probes,
+                endpoint=args.endpoint,
                 seed=args.seed,
             )
         except Exception as e:

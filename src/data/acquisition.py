@@ -226,12 +226,25 @@ def filter_low_variance(expr: pd.DataFrame, threshold: float, n_top: int) -> Tup
     return filtered, top_genes
 
 
-def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str = "vital_status") -> Tuple[pd.DataFrame, pd.Series]:
+def align_and_label(
+    expr: pd.DataFrame,
+    clinical: pd.DataFrame,
+    label_col: str = "vital_status",
+    event_mapping: Optional[Dict[str, int]] = None,
+) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Align expression (genes × patients) with clinical labels.
+
+    Args:
+        expr: (n_genes × n_patients) DataFrame
+        clinical: DataFrame indexed by patient ID
+        label_col: Name of clinical outcome column
+        event_mapping: Optional explicit mapping dictionary from categorical
+            values to binary event indicator ({category: 0 or 1}).
+
     Returns:
         X : (n_samples × n_genes) DataFrame
-        y : binary Series (1 = Dead, 0 = Alive)
+        y : binary Series (1 = Event, 0 = Event-Free)
     """
     common_patients = expr.columns.intersection(clinical.index)
     if len(common_patients) == 0:
@@ -240,12 +253,103 @@ def align_and_label(expr: pd.DataFrame, clinical: pd.DataFrame, label_col: str =
 
     X = expr[common_patients].T  # samples × genes
     y_raw = clinical.loc[common_patients, label_col]
-    if pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == "object":
+
+    # Exclude missing events (prohibit converting NaN events to censored 0)
+    valid_event_mask = y_raw.notna()
+    if not valid_event_mask.all():
+        dropped_count = int((~valid_event_mask).sum())
+        logger.warning(
+            "Excluding %d samples with missing outcome labels (prohibiting silent conversion of NaN to censored 0).",
+            dropped_count
+        )
+        X = X.loc[valid_event_mask]
+        y_raw = y_raw.loc[valid_event_mask]
+
+    # Map clinical outcome to binary indicator (1 = Event, 0 = Event-Free)
+    if event_mapping is not None:
+        if not isinstance(event_mapping, dict):
+            raise TypeError(f"event_mapping must be a dict, got {type(event_mapping).__name__}")
+        invalid_targets = [v for v in event_mapping.values() if v not in (0, 1)]
+        if invalid_targets:
+            raise ValueError(
+                f"Explicit event_mapping values must be binary in {{0, 1}}, got invalid values: {invalid_targets}"
+            )
+        norm_mapping = {str(k).strip().lower(): int(v) for k, v in event_mapping.items()}
+        y_lower = y_raw.astype(str).str.strip().str.lower()
+        mapped = y_lower.map(norm_mapping)
+        valid_mask = mapped.notna()
+        if not valid_mask.any():
+            unique_vals = sorted(list(y_lower.dropna().unique()))
+            raise ValueError(
+                f"None of the categories ({unique_vals}) in '{label_col}' matched the provided explicit event_mapping ({event_mapping})."
+            )
+        if not valid_mask.all():
+            n_unmapped = int((~valid_mask).sum())
+            unmapped_vals = sorted(list(y_lower.loc[~valid_mask].unique()))
+            logger.warning(
+                "Excluding %d sample(s) with categories (%s) not in explicit event_mapping.",
+                n_unmapped, unmapped_vals
+            )
+            X = X.loc[valid_mask]
+            mapped = mapped.loc[valid_mask]
+        y = mapped.astype(int)
+    elif pd.api.types.is_string_dtype(y_raw) or y_raw.dtype == "object":
         y_lower = y_raw.astype(str).str.strip().str.lower()
         event_markers = {"dead", "deceased", "recurred", "relapsed", "progressed", "event", "yes", "true", "1", "1.0"}
-        y = y_lower.isin(event_markers).astype(int)
+        free_markers  = {"alive", "disease free", "progression free", "no event", "censored", "no", "false", "0", "0.0"}
+
+        is_event = y_lower.isin(event_markers)
+        is_free = y_lower.isin(free_markers)
+        valid_marker_mask = is_event | is_free
+
+        if valid_marker_mask.any():
+            # Prohibit converting unknown phenotype categories to event-free (0)
+            n_unmapped = int((~valid_marker_mask).sum())
+            if n_unmapped > 0:
+                unmapped_categories = sorted(list(y_lower.loc[~valid_marker_mask].unique()))
+                logger.warning(
+                    "Excluding %d sample(s) with unknown or unmapped phenotype categories (%s) "
+                    "— prohibiting silent conversion to event-free (0).",
+                    n_unmapped, unmapped_categories
+                )
+                X = X.loc[valid_marker_mask]
+                y_lower = y_lower.loc[valid_marker_mask]
+                is_event = is_event.loc[valid_marker_mask]
+
+            y = is_event.astype(int)
+        else:
+            unique_vals = sorted(list(y_lower.dropna().unique()))
+            unknown_markers = {
+                "unknown", "not reported", "[not reported]", "not available", "[not available]",
+                "indeterminate", "equivocal", "discrepancy", "nan", "null", "none", "unresolved"
+            }
+            if any(val in unknown_markers for val in unique_vals):
+                raise ValueError(
+                    f"Phenotype column '{label_col}' contains invalid/unknown categories ({unique_vals}). "
+                    "Conversion of unknown phenotypes to event-free (0) is strictly prohibited."
+                )
+            raise ValueError(
+                f"Phenotype column '{label_col}' contains unmapped or ambiguous categorical values ({unique_vals}). "
+                "Explicit, verified event/free mappings are required for categorical clinical outcomes; "
+                "automatic or heuristic binary fallback mapping is strictly prohibited."
+            )
     else:
-        y = (y_raw != 0).astype(int)
+        y_num = pd.to_numeric(y_raw, errors="coerce")
+        valid_num_mask = y_num.notna() & y_num.isin([0, 1])
+        if not valid_num_mask.all():
+            logger.warning(
+                "Excluding %d samples with invalid numeric event values (must be 0 or 1).",
+                int((~valid_num_mask).sum())
+            )
+            X = X.loc[valid_num_mask]
+            y_num = y_num.loc[valid_num_mask]
+        y = y_num.astype(int)
+
+    if len(y) == 0:
+        raise ValueError(
+            f"No valid binary outcome labels remain for column '{label_col}' after excluding invalid/missing values."
+        )
+
     y.name = "label"
     return X, y
 
