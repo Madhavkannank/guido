@@ -1,225 +1,384 @@
 import React, { useState } from 'react'
 import axios from 'axios'
+import IntakeSpecModal from './IntakeSpecModal'
 
-// Empty string = relative URLs (/api/…) — works in Docker where API and UI share the same origin.
-// Vite's dev-server proxy handles /api/* → http://127.0.0.1:8000 during local development.
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
-const diseaseOptions = [
-  // Master Pan-Cancer Clinical Model
-  { value: 'pan_cancer_all', label: '★ TCGA-PAN-CANCER-ALL (Master 33-Cohort Clinical Engine)' },
-  // All 33 TCGA Cohorts (Evaluated via Master Engine & Calibrated Cohort Weights)
-  { value: 'adrenocortical_carcinoma', label: 'Adrenocortical Carcinoma (ACC)' },
-  { value: 'bladder_urothelial_carcinoma', label: 'Bladder Urothelial Carcinoma (BLCA)' },
-  { value: 'breast_invasive_carcinoma', label: 'Breast Invasive Carcinoma (BRCA)' },
-  { value: 'cervical_squamous_cell_carcinoma', label: 'Cervical Squamous Cell Carcinoma (CESC)' },
-  { value: 'cholangiocarcinoma', label: 'Cholangiocarcinoma (CHOL)' },
-  { value: 'colon_adenocarcinoma', label: 'Colon Adenocarcinoma (COAD)' },
-  { value: 'diffuse_large_b_cell_lymphoma', label: 'Diffuse Large B-Cell Lymphoma (DLBC)' },
-  { value: 'esophageal_carcinoma', label: 'Esophageal Carcinoma (ESCA)' },
-  { value: 'glioblastoma_multiforme', label: 'Glioblastoma Multiforme (GBM)' },
-  { value: 'head_and_neck_squamous_cell_carcinoma', label: 'Head and Neck Squamous Cell Carcinoma (HNSC)' },
-  { value: 'kidney_chromophobe', label: 'Kidney Chromophobe (KICH)' },
-  { value: 'kidney_renal_clear_cell_carcinoma', label: 'Kidney Renal Clear Cell Carcinoma (KIRC)' },
-  { value: 'kidney_renal_papillary_cell_carcinoma', label: 'Kidney Renal Papillary Cell Carcinoma (KIRP)' },
-  { value: 'acute_myeloid_leukemia', label: 'Acute Myeloid Leukemia (LAML)' },
-  { value: 'brain_lower_grade_glioma', label: 'Brain Lower Grade Glioma (LGG)' },
-  { value: 'liver_hepatocellular_carcinoma', label: 'Liver Hepatocellular Carcinoma (LIHC)' },
-  { value: 'lung_adenocarcinoma', label: 'Lung Adenocarcinoma (LUAD)' },
-  { value: 'lung_squamous_cell_carcinoma', label: 'Lung Squamous Cell Carcinoma (LUSC)' },
-  { value: 'mesothelioma', label: 'Mesothelioma (MESO)' },
-  { value: 'ovarian_serous_cystadenocarcinoma', label: 'Ovarian Serous Cystadenocarcinoma (OV)' },
-  { value: 'pancreatic_adenocarcinoma', label: 'Pancreatic Adenocarcinoma (PAAD)' },
-  { value: 'pheochromocytoma_and_paraganglioma', label: 'Pheochromocytoma and Paraganglioma (PCPG)' },
-  { value: 'prostate_adenocarcinoma', label: 'Prostate Adenocarcinoma (PRAD)' },
-  { value: 'rectum_adenocarcinoma', label: 'Rectum Adenocarcinoma (READ)' },
-  { value: 'sarcoma', label: 'Sarcoma (SARC)' },
-  { value: 'skin_cutaneous_melanoma', label: 'Skin Cutaneous Melanoma (SKCM)' },
-  { value: 'stomach_adenocarcinoma', label: 'Stomach Adenocarcinoma (STAD)' },
-  { value: 'testicular_germ_cell_tumors', label: 'Testicular Germ Cell Tumors (TGCT)' },
-  { value: 'thyroid_carcinoma', label: 'Thyroid Carcinoma (THCA)' },
-  { value: 'thymoma', label: 'Thymoma (THYM)' },
-  { value: 'uterine_corpus_endometrial_carcinoma', label: 'Uterine Corpus Endometrial Carcinoma (UCEC)' },
-  { value: 'uterine_carcinosarcoma', label: 'Uterine Carcinosarcoma (UCS)' },
-  { value: 'uveal_melanoma', label: 'Uveal Melanoma (UVM)' }
+const COHORT_OPTIONS = [
+  { value: 'PAN-CANCER-ALL', label: '★ TCGA-PAN-CANCER-ALL (Master 33-Cohort Foundation Engine)', projectId: 'TCGA-PAN-CANCER-ALL' },
+  { value: 'BRCA', label: 'Breast Invasive Carcinoma (BRCA)', projectId: 'TCGA-BRCA' },
+  { value: 'LUAD', label: 'Lung Adenocarcinoma (LUAD)', projectId: 'TCGA-LUAD' },
+  { value: 'LUSC', label: 'Lung Squamous Cell Carcinoma (LUSC)', projectId: 'TCGA-LUSC' },
+  { value: 'KIRC', label: 'Kidney Renal Clear Cell Carcinoma (KIRC)', projectId: 'TCGA-KIRC' },
+  { value: 'KIRP', label: 'Kidney Renal Papillary Cell Carcinoma (KIRP)', projectId: 'TCGA-KIRP' },
+  { value: 'COAD', label: 'Colon Adenocarcinoma (COAD)', projectId: 'TCGA-COAD' },
+  { value: 'STAD', label: 'Stomach Adenocarcinoma (STAD)', projectId: 'TCGA-STAD' },
+  { value: 'LIHC', label: 'Liver Hepatocellular Carcinoma (LIHC)', projectId: 'TCGA-LIHC' },
+  { value: 'GBM', label: 'Glioblastoma Multiforme (GBM)', projectId: 'TCGA-GBM' },
+  { value: 'LGG', label: 'Brain Lower Grade Glioma (LGG)', projectId: 'TCGA-LGG' },
+  { value: 'OV', label: 'Ovarian Serous Cystadenocarcinoma (OV)', projectId: 'TCGA-OV' },
+  { value: 'UCEC', label: 'Uterine Corpus Endometrial Carcinoma (UCEC)', projectId: 'TCGA-UCEC' },
+  { value: 'BLCA', label: 'Bladder Urothelial Carcinoma (BLCA)', projectId: 'TCGA-BLCA' },
+  { value: 'PRAD', label: 'Prostate Adenocarcinoma (PRAD)', projectId: 'TCGA-PRAD' },
+  { value: 'HNSC', label: 'Head and Neck Squamous Cell Carcinoma (HNSC)', projectId: 'TCGA-HNSC' },
+  { value: 'THCA', label: 'Thyroid Carcinoma (THCA)', projectId: 'TCGA-THCA' },
+  { value: 'SARC', label: 'Sarcoma (SARC)', projectId: 'TCGA-SARC' },
+  { value: 'SKCM', label: 'Skin Cutaneous Melanoma (SKCM)', projectId: 'TCGA-SKCM' },
+  { value: 'LAML', label: 'Acute Myeloid Leukemia (LAML)', projectId: 'TCGA-LAML' },
 ]
 
-const SAMPLE_FILES = [
-  {
-    value: 'positive',
-    label: 'Clinical Case — High Recurrence Risk Profile (LUAD)',
-    url: '/sample_positive_LUAD.csv',
-    filename: 'sample_positive_LUAD.csv',
-    badge: 'HIGH RISK',
-    badgeColor: 'text-[var(--crimson,#e06c75)]',
-    note: 'Real clinical patient RNA-seq profile · High 3-Year Progression Risk',
-  },
-  {
-    value: 'negative',
-    label: 'Clinical Case — Low Recurrence Risk Profile (LUAD)',
-    url: '/sample_negative_LUAD.csv',
-    filename: 'sample_negative_LUAD.csv',
-    badge: 'LOW RISK',
-    badgeColor: 'text-[var(--green,#7A9A78)]',
-    note: 'Real clinical patient RNA-seq profile · Favorable Progression-Free Prognosis',
-  },
-]
-
-export default function PredictionForm({onResult}){
-  const [csv, setCsv] = useState(null)
+export default function PredictionForm({ onResult }) {
+  const [selectedCohort, setSelectedCohort] = useState('LUAD')
+  const [fileMode, setFileMode] = useState('synthetic') // 'synthetic' | 'own'
+  const [testRiskProfile, setTestRiskProfile] = useState('positive') // 'positive' | 'negative'
+  const [csvFile, setCsvFile] = useState(null)
+  const [jsonPayload, setJsonPayload] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [projectId, setProjectId] = useState('TCGA-PAN-CANCER-ALL')
-  const [disease, setDisease] = useState('pan_cancer_all')
-  const [jsonPayload, setJsonPayload] = useState('')
-  const [fileSource, setFileSource] = useState('own')   // 'own' | 'positive' | 'negative'
+  const [showSpecModal, setShowSpecModal] = useState(false)
 
-  const handleDiseaseChange = (e) => {
-    const val = e.target.value;
-    setDisease(val);
-    const mapping = {
-      'pan_cancer_all': 'TCGA-PAN-CANCER-ALL',
-      // TCGA 33 Cohorts
-      'adrenocortical_carcinoma': 'TCGA-ACC',
-      'bladder_urothelial_carcinoma': 'TCGA-BLCA',
-      'breast_invasive_carcinoma': 'TCGA-BRCA',
-      'cervical_squamous_cell_carcinoma': 'TCGA-CESC',
-      'cholangiocarcinoma': 'TCGA-CHOL',
-      'colon_adenocarcinoma': 'TCGA-COAD',
-      'diffuse_large_b_cell_lymphoma': 'TCGA-DLBC',
-      'esophageal_carcinoma': 'TCGA-ESCA',
-      'glioblastoma_multiforme': 'TCGA-GBM',
-      'head_and_neck_squamous_cell_carcinoma': 'TCGA-HNSC',
-      'kidney_chromophobe': 'TCGA-KICH',
-      'kidney_renal_clear_cell_carcinoma': 'TCGA-KIRC',
-      'kidney_renal_papillary_cell_carcinoma': 'TCGA-KIRP',
-      'acute_myeloid_leukemia': 'TCGA-LAML',
-      'brain_lower_grade_glioma': 'TCGA-LGG',
-      'liver_hepatocellular_carcinoma': 'TCGA-LIHC',
-      'lung_adenocarcinoma': 'TCGA-LUAD',
-      'lung_squamous_cell_carcinoma': 'TCGA-LUSC',
-      'mesothelioma': 'TCGA-MESO',
-      'ovarian_serous_cystadenocarcinoma': 'TCGA-OV',
-      'pancreatic_adenocarcinoma': 'TCGA-PAAD',
-      'pheochromocytoma_and_paraganglioma': 'TCGA-PCPG',
-      'prostate_adenocarcinoma': 'TCGA-PRAD',
-      'rectum_adenocarcinoma': 'TCGA-READ',
-      'sarcoma': 'TCGA-SARC',
-      'skin_cutaneous_melanoma': 'TCGA-SKCM',
-      'stomach_adenocarcinoma': 'TCGA-STAD',
-      'testicular_germ_cell_tumors': 'TCGA-TGCT',
-      'thyroid_carcinoma': 'TCGA-THCA',
-      'thymoma': 'TCGA-THYM',
-      'uterine_corpus_endometrial_carcinoma': 'TCGA-UCEC',
-      'uterine_carcinosarcoma': 'TCGA-UCS',
-      'uveal_melanoma': 'TCGA-UVM'
-    };
-    if (mapping[val]) setProjectId(mapping[val]);
-  };
+  const currentCohort = COHORT_OPTIONS.find(c => c.value === selectedCohort) || COHORT_OPTIONS[1]
+  const posFileName = `${selectedCohort}-positive.csv`
+  const negFileName = `${selectedCohort}-negative.csv`
+  const activeTestFile = testRiskProfile === 'positive' ? posFileName : negFileName
+  const activeTestUrl = `/samples/${activeTestFile}`
 
-  async function handleSubmit(e){
+  async function handleSubmit(e) {
     e.preventDefault()
-    setLoading(true); setError(null)
-    try{
+    setLoading(true)
+    setError(null)
+    try {
       const formData = new FormData()
-      formData.append('project_id', projectId)
-      formData.append('disease_name', disease)
+      formData.append('project_id', currentCohort.projectId)
+      formData.append('disease_name', selectedCohort.toLowerCase())
 
-      if (fileSource === 'own') {
-        if (csv) formData.append('file', csv)
-        if (!csv && jsonPayload) formData.append('json_payload', jsonPayload)
-      } else {
-        const sample = SAMPLE_FILES.find(s => s.value === fileSource)
-        if (sample) {
-          const resp = await fetch(sample.url)
-          const blob = await resp.blob()
-          const file = new File([blob], sample.filename, { type: 'text/csv' })
-          formData.append('file', file)
+      if (fileMode === 'own') {
+        if (csvFile) {
+          formData.append('file', csvFile)
+        } else if (jsonPayload) {
+          formData.append('json_payload', jsonPayload)
+        } else {
+          throw new Error('Please select a CSV file or paste gene expression JSON.')
         }
+      } else {
+        // Fetch the calibrated synthetic benchmark file
+        let resp
+        try {
+          resp = await fetch(activeTestUrl)
+          if (!resp.ok) {
+            // Fallback to root if samples subfolder doesn't resolve
+            resp = await fetch(`/${activeTestFile}`)
+          }
+        } catch {
+          resp = await fetch(`/${activeTestFile}`)
+        }
+
+        if (!resp || !resp.ok) {
+          throw new Error(`Synthetic test file ${activeTestFile} could not be loaded.`)
+        }
+        const blob = await resp.blob()
+        const file = new File([blob], activeTestFile, { type: 'text/csv' })
+        formData.append('file', file)
       }
 
-      const resp = await axios.post(`${API_BASE}/api/ui/predict`, formData)
-      onResult(resp.data)
-    }catch(err){
-      const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message || 'Unknown error'
-      setError(`Prediction failed: ${detail}`)
-    }finally{ setLoading(false) }
+      const apiResp = await axios.post(`${API_BASE}/api/ui/predict`, formData)
+      onResult(apiResp.data)
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message || 'Unknown error occurred during prediction.'
+      setError(`Prediction pipeline error: ${detail}`)
+    } finally {
+      setLoading(false)
+    }
   }
 
-  const selectedSample = SAMPLE_FILES.find(s => s.value === fileSource)
-
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <div className="mb-6 p-4 rounded-lg bg-[rgba(90,106,83,0.05)] border border-[rgba(90,106,83,0.2)]">
-        <h4 className="text-sm font-semibold text-[var(--green)] mb-3 uppercase tracking-wider">How to use your own clinical data</h4>
-        <ul className="text-sm text-[var(--sub)] space-y-2 list-disc pl-4">
-          <li><strong>1. Tissue Biopsy:</strong> Obtain a tumor tissue sample via biopsy or surgical resection.</li>
-          <li><strong>2. RNA Sequencing:</strong> Send the sample to a clinical genomics lab (e.g., Illumina, Foundation Medicine) for bulk RNA-Sequencing.</li>
-          <li><strong>3. Data Processing:</strong> Request raw gene expression counts and normalize using <code className="text-[var(--text)] bg-[rgba(255,255,255,0.05)] px-1 rounded">log2(count + 1)</code>.</li>
-          <li><strong>4. Formatting:</strong> Format as a CSV where the header row contains gene names and values are normalized expression levels.</li>
-        </ul>
+    <div className="space-y-4">
+      {/* Intake Specification Modal */}
+      <IntakeSpecModal isOpen={showSpecModal} onClose={() => setShowSpecModal(false)} />
+
+      {/* Clinical Guidance Banner with Spec PDF Link */}
+      <div style={{
+        background: 'rgba(90, 106, 83, 0.08)',
+        border: '1px solid rgba(90, 106, 83, 0.25)',
+        borderRadius: 10,
+        padding: '1.25rem',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 12,
+      }}>
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--green, #5A6A53)', textTransform: 'uppercase', letterSpacing: 1 }}>
+              Clinical Intake Standard & Parameters Guide
+            </span>
+            <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(90,106,83,0.2)', color: '#AABAA3' }}>
+              HGNC / log₂(TPM+1)
+            </span>
+          </div>
+          <p style={{ fontSize: 12, color: 'var(--sub, #888)', margin: '4px 0 0', maxWidth: 540 }}>
+            Review sample quality requirements (DV200 ≥ 30%), gene normalization protocols, and multi-omics formatting specifications before running clinical patient data.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowSpecModal(true)}
+          style={{
+            background: 'rgba(90, 106, 83, 0.2)',
+            border: '1px solid rgba(90, 106, 83, 0.4)',
+            color: '#F2EAE6',
+            borderRadius: 8,
+            padding: '0.5rem 1rem',
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            transition: 'all 0.15s ease',
+          }}
+        >
+          📄 View / Download Intake Spec (PDF)
+        </button>
       </div>
 
-      <div className="grid grid-cols-1 gap-3">
+      <form onSubmit={handleSubmit} className="space-y-4">
+        {/* Step 1: Select Cancer Cohort */}
         <div>
-          <label className="text-sm subtle">Disease</label>
-          <select className="w-full p-2 rounded bg-[var(--surface)] border border-[var(--border)] text-[var(--text)]" value={disease} onChange={handleDiseaseChange}>
-            {diseaseOptions.map(opt => (
+          <label className="text-sm subtle" style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span>1. Cancer Type & Organ Cohort</span>
+            <span style={{ color: 'var(--green, #5A6A53)', fontWeight: 600 }}>Active Model: {currentCohort.projectId}</span>
+          </label>
+          <select
+            className="w-full p-2.5 rounded bg-[var(--surface)] border border-[var(--border)] text-[var(--text)]"
+            value={selectedCohort}
+            onChange={e => setSelectedCohort(e.target.value)}
+            style={{ fontSize: 13 }}
+          >
+            {COHORT_OPTIONS.map(opt => (
               <option key={opt.value} value={opt.value}>{opt.label}</option>
             ))}
           </select>
         </div>
 
+        {/* Step 2: Intake Method Selector */}
         <div>
-          <label className="text-sm subtle">File source</label>
-          <select
-            className="w-full p-2 rounded bg-[var(--surface)] border border-[var(--border)] text-[var(--text)]"
-            value={fileSource}
-            onChange={e => { setFileSource(e.target.value); setCsv(null) }}
-          >
-            <option value="own">Upload my own file</option>
-            <optgroup label="── Sample files ──">
-              {SAMPLE_FILES.map(s => (
-                <option key={s.value} value={s.value}>{s.label}</option>
-              ))}
-            </optgroup>
-          </select>
+          <label className="text-sm subtle">2. Data Intake Method</label>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <button
+              type="button"
+              onClick={() => setFileMode('synthetic')}
+              style={{
+                padding: '0.75rem',
+                borderRadius: 8,
+                textAlign: 'left',
+                background: fileMode === 'synthetic' ? 'rgba(90, 106, 83, 0.2)' : 'var(--surface)',
+                border: `1px solid ${fileMode === 'synthetic' ? 'var(--green, #5A6A53)' : 'var(--border)'}`,
+                cursor: 'pointer',
+                color: 'var(--text)',
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 700, color: fileMode === 'synthetic' ? '#F2EAE6' : '#CCC' }}>
+                ⚡ Test with Calibrated Benchmark File
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--sub, #888)', marginTop: 2 }}>
+                Pre-calibrated {selectedCohort} synthetic positive & negative risk profiles
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setFileMode('own')}
+              style={{
+                padding: '0.75rem',
+                borderRadius: 8,
+                textAlign: 'left',
+                background: fileMode === 'own' ? 'rgba(90, 106, 83, 0.2)' : 'var(--surface)',
+                border: `1px solid ${fileMode === 'own' ? 'var(--green, #5A6A53)' : 'var(--border)'}`,
+                cursor: 'pointer',
+                color: 'var(--text)',
+              }}
+            >
+              <div style={{ fontSize: 13, fontWeight: 700, color: fileMode === 'own' ? '#F2EAE6' : '#CCC' }}>
+                📁 Upload My Own Patient Data
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--sub, #888)', marginTop: 2 }}>
+                Custom RNA-seq CSV normalized to log₂(TPM + 1)
+              </div>
+            </button>
+          </div>
         </div>
 
-        {fileSource === 'own' ? (
-          <>
-            <div>
-              <label className="text-sm subtle">Upload CSV (samples × features)</label>
-              <div className="upload-zone mt-1">
-                <input type="file" accept="text/csv" onChange={e => setCsv(e.target.files[0])} />
+        {/* Dynamic Panel: Synthetic Benchmark File Selector */}
+        {fileMode === 'synthetic' ? (
+          <div style={{
+            background: 'var(--surface, #252525)',
+            border: '1px solid var(--border, #2E2E2E)',
+            borderRadius: 10,
+            padding: '1.25rem',
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#AABAA3', marginBottom: 10 }}>
+              Select Calibrated Test Profile for <span style={{ color: '#F2EAE6' }}>{selectedCohort}</span>:
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              {/* Positive Risk Profile */}
+              <div
+                onClick={() => setTestRiskProfile('positive')}
+                style={{
+                  padding: '1rem',
+                  borderRadius: 8,
+                  background: testRiskProfile === 'positive' ? 'rgba(184, 74, 74, 0.15)' : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${testRiskProfile === 'positive' ? 'rgba(184, 74, 74, 0.5)' : 'rgba(255,255,255,0.05)'}`,
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: '#e06c75', textTransform: 'uppercase' }}>
+                    ● High Progression Risk (&gt;65%)
+                  </span>
+                  <span style={{ fontSize: 10, color: 'var(--sub, #888)', fontFamily: 'monospace' }}>.CSV</span>
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#EDEDED', marginTop: 4 }}>
+                  {posFileName}
+                </div>
+                <p style={{ fontSize: 11, color: 'var(--sub, #888)', margin: '4px 0 0' }}>
+                  Elevated Proliferation, EMT Invasion, Hypoxia, and Glycolysis metagenes.
+                </p>
+                <div style={{ marginTop: 8 }}>
+                  <a
+                    href={`/samples/${posFileName}`}
+                    download
+                    onClick={e => e.stopPropagation()}
+                    style={{ fontSize: 11, color: '#AABAA3', textDecoration: 'underline' }}
+                  >
+                    ⬇ Download {posFileName}
+                  </a>
+                </div>
+              </div>
+
+              {/* Negative Risk Profile */}
+              <div
+                onClick={() => setTestRiskProfile('negative')}
+                style={{
+                  padding: '1rem',
+                  borderRadius: 8,
+                  background: testRiskProfile === 'negative' ? 'rgba(90, 106, 83, 0.2)' : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${testRiskProfile === 'negative' ? 'rgba(90, 106, 83, 0.6)' : 'rgba(255,255,255,0.05)'}`,
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: '#7A9A78', textTransform: 'uppercase' }}>
+                    ● Favorable / Low Risk (&lt;35%)
+                  </span>
+                  <span style={{ fontSize: 10, color: 'var(--sub, #888)', fontFamily: 'monospace' }}>.CSV</span>
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#EDEDED', marginTop: 4 }}>
+                  {negFileName}
+                </div>
+                <p style={{ fontSize: 11, color: 'var(--sub, #888)', margin: '4px 0 0' }}>
+                  Suppressed oncogenic drivers; intact DNA damage repair and differentiation.
+                </p>
+                <div style={{ marginTop: 8 }}>
+                  <a
+                    href={`/samples/${negFileName}`}
+                    download
+                    onClick={e => e.stopPropagation()}
+                    style={{ fontSize: 11, color: '#AABAA3', textDecoration: 'underline' }}
+                  >
+                    ⬇ Download {negFileName}
+                  </a>
+                </div>
               </div>
             </div>
-            <div>
-              <label className="text-sm subtle">Or paste JSON sample (object or array)</label>
-              <textarea rows={4} className="w-full p-2 mt-2 rounded" placeholder='{"GENE1":1.2,"GENE2":0.4}' value={jsonPayload} onChange={e=>setJsonPayload(e.target.value)} />
+
+            <div style={{ fontSize: 11, color: 'var(--sub, #888)', marginTop: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>ℹ</span>
+              <span>Loaded file: <strong style={{ color: '#F2EAE6' }}>{activeTestFile}</strong> · Evaluated with the 70/30 Dual-Consensus Engine.</span>
             </div>
-          </>
+          </div>
         ) : (
-          <div className="p-3 rounded-lg bg-[rgba(255,255,255,0.03)] border border-[var(--border)] flex items-start gap-3">
-            <div className="mt-0.5 text-lg">🧬</div>
+          /* Dynamic Panel: Upload Own File */
+          <div style={{
+            background: 'var(--surface, #252525)',
+            border: '1px solid var(--border, #2E2E2E)',
+            borderRadius: 10,
+            padding: '1.25rem',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 12,
+          }}>
             <div>
-              <p className="text-sm font-medium text-[var(--text)]">{selectedSample?.filename}</p>
-              <p className="text-xs mt-0.5">
-                Expected result: <span className={`font-semibold ${selectedSample?.badgeColor}`}>{selectedSample?.badge}</span>
-              </p>
-              <p className="text-[11px] text-[var(--sub)] mt-1">{selectedSample?.note}</p>
+              <label className="text-sm subtle">Upload CSV File (Single patient row or samples × features)</label>
+              <div className="upload-zone mt-1" style={{ border: '1px dashed var(--border)', padding: '1rem', borderRadius: 8, textAlign: 'center' }}>
+                <input
+                  type="file"
+                  accept=".csv,.tsv,.txt"
+                  onChange={e => setCsvFile(e.target.files[0])}
+                  style={{ fontSize: 12 }}
+                />
+              </div>
+              {csvFile && (
+                <div style={{ fontSize: 11, color: '#AABAA3', marginTop: 4 }}>
+                  ✓ Selected file: <strong>{csvFile.name}</strong> ({(csvFile.size / 1024).toFixed(1)} KB)
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="text-sm subtle">Or Paste JSON Patient Profile</label>
+              <textarea
+                rows={3}
+                className="w-full p-2.5 rounded bg-[#121212] border border-[var(--border)] text-[var(--text)] font-mono text-xs"
+                placeholder='{"MKI67": 10.4, "TP53": 8.2, "VEGFA": 9.1, "BRCA1": 5.4}'
+                value={jsonPayload}
+                onChange={e => setJsonPayload(e.target.value)}
+              />
             </div>
           </div>
         )}
-      </div>
 
-      <div className="flex items-center gap-3">
-        <button type="submit" className="submit-btn" disabled={loading}>
-          {loading ? 'Processing…' : 'Submit'}
-        </button>
-        {loading && <div className="subtle">This may take a moment…</div>}
-      </div>
-      {error && <div className="text-sm text-red-400">{error}</div>}
-    </form>
+        {/* Submit Execution */}
+        <div className="flex items-center gap-3 pt-2">
+          <button
+            type="submit"
+            className="submit-btn"
+            disabled={loading}
+            style={{
+              background: 'var(--green, #5A6A53)',
+              color: '#F2EAE6',
+              fontWeight: 700,
+              fontSize: 13,
+              letterSpacing: 0.5,
+              padding: '0.7rem 1.8rem',
+              borderRadius: 8,
+              border: 'none',
+              cursor: loading ? 'not-allowed' : 'pointer',
+              boxShadow: '0 4px 14px rgba(90,106,83,0.3)',
+            }}
+          >
+            {loading ? 'Executing Dual-Consensus Engine…' : `Run Prediction (${selectedCohort})`}
+          </button>
+          {loading && <div className="subtle" style={{ fontSize: 12 }}>Extracting 12 Hallmark Metagenes & running consensus inference…</div>}
+        </div>
+
+        {error && (
+          <div style={{
+            background: 'rgba(232, 112, 112, 0.1)',
+            border: '1px solid rgba(232, 112, 112, 0.3)',
+            borderRadius: 8,
+            padding: '0.75rem',
+            color: '#f87171',
+            fontSize: 12,
+          }}>
+            {error}
+          </div>
+        )}
+      </form>
+    </div>
   )
 }
