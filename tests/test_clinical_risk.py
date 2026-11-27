@@ -413,4 +413,37 @@ def test_load_cohort_methylation_barcode_alignment(tmp_path, monkeypatch):
     assert not df_aligned.isna().any().any()
 
 
+def test_load_cohort_methylation_tsv_streaming_alignment(tmp_path, monkeypatch):
+    """Verify that multi-omics methylation raw TSV streaming extracts top variance probes without memory spikes."""
+    xena_dir = tmp_path / "data" / "raw" / "xena"
+    xena_dir.mkdir(parents=True, exist_ok=True)
+    tsv_path = xena_dir / "TCGA.KICH.sampleMap_HumanMethylation450.tsv"
+
+    patients = [f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+    meth_barcodes = [f"{pt}-01" for pt in patients]
+    probes = [f"cg{i:08d}" for i in range(1, 30)]
+
+    rng = np.random.default_rng(42)
+    data = rng.uniform(0.1, 0.9, size=(len(probes), len(meth_barcodes)))
+    data[7, :] = np.linspace(0.01, 0.99, len(meth_barcodes))  # probe 8 has highest variance
+
+    df_meth = pd.DataFrame(data, index=probes, columns=meth_barcodes)
+    df_meth.to_csv(tsv_path, sep="\t", index_label="sample")
+
+    import retrain_fixed
+    monkeypatch.setattr(retrain_fixed, "ROOT", tmp_path)
+    monkeypatch.setattr(retrain_fixed, "XENA_DIR", xena_dir)
+
+    target_samples = [f"TCGA-KL-{i:04d}-01" if i % 2 == 0 else f"TCGA-KL-{i:04d}" for i in range(1, 15)]
+
+    df_aligned = load_cohort_methylation("KICH", target_samples=target_samples, max_probes=5)
+
+    assert df_aligned is not None
+    assert df_aligned.shape == (len(target_samples), 5)
+    assert all(c.startswith("METH_") for c in df_aligned.columns)
+    assert df_aligned.columns[0] == "METH_cg00000008"
+    assert list(df_aligned.index) == target_samples
+    assert not df_aligned.isna().any().any()
+
+
 

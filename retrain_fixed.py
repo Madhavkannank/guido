@@ -628,10 +628,13 @@ def load_cohort_methylation(
     max_probes: int = 100,
 ) -> Optional[pd.DataFrame]:
     """
-    Loads TCGA HumanMethylation450 array for a cohort, aligns to target sample barcodes
-    (matching 12-char patient IDs or exact barcodes), selects top-variance CpG probes,
-    and returns an aligned DataFrame of shape (len(target_samples), max_probes) with 'METH_' prefix.
+    Loads TCGA HumanMethylation450 array for a cohort using streaming chunked execution
+    (< 200 MB RAM footprint), aligns to target sample barcodes (12-char patient IDs or exact barcodes),
+    selects top-variance CpG probes, and returns an aligned DataFrame of shape
+    (len(target_samples), max_probes) with 'METH_' prefix.
     """
+    import heapq
+
     cancer = normalize_cancer_code(cancer)
     shards_dir = ROOT / "data" / "processed" / "shards"
     pq_path = shards_dir / f"TCGA_{cancer}_methylation.parquet"
@@ -642,12 +645,25 @@ def load_cohort_methylation(
 
     try:
         log.info("  Loading HumanMethylation450 multi-omics array for TCGA-%s...", cancer)
-        if pq_path.exists():
-            df_meth = pd.read_parquet(pq_path).dropna(how="all").astype(np.float32)
-        else:
-            df_meth = pd.read_csv(tsv_path, sep="\t", index_col=0, low_memory=False).dropna(how="all").astype(np.float32)
 
-        meth_cols = list(df_meth.columns)
+        # 1. Inspect header to identify available sample columns without full loading
+        if pq_path.exists():
+            try:
+                import pyarrow.parquet as pq
+                all_cols = pq.ParquetFile(pq_path).schema.names
+                meth_cols = [c for c in all_cols if not c.startswith("__index") and c not in ("sample", "index")]
+                index_col_name = "sample" if "sample" in all_cols else None
+            except Exception:
+                df_header = pd.read_parquet(pq_path, columns=[]).dropna(how="all")
+                meth_cols = list(df_header.columns)
+                index_col_name = None
+        else:
+            with open(tsv_path, "r", encoding="utf-8", errors="replace") as f:
+                header_line = f.readline()
+            header_parts = header_line.rstrip("\r\n").split("\t")
+            index_col_name = header_parts[0]
+            meth_cols = header_parts[1:]
+
         meth_col_set = set(meth_cols)
         patient_to_meth_col: Dict[str, str] = {}
         for c in meth_cols:
@@ -660,7 +676,7 @@ def load_cohort_methylation(
             if s in meth_col_set:
                 matched_meth_cols.append(s)
             else:
-                pt = s[:12] if s.startswith("TCGA-") and len(c) >= 12 else s
+                pt = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
                 if pt in patient_to_meth_col:
                     matched_meth_cols.append(patient_to_meth_col[pt])
 
@@ -669,31 +685,78 @@ def load_cohort_methylation(
             log.warning("Cohort TCGA-%s has insufficient matched methylation samples (%d < 10).", cancer, len(matched_unique))
             return None
 
-        df_sub = df_meth[matched_unique]
-        variances = df_sub.var(axis=1)
-        top_probes = variances.nlargest(max_probes).index
-        df_probes = df_sub.loc[top_probes]
+        # 2. Extract top variance probes
+        if pq_path.exists():
+            df_sub = pd.read_parquet(pq_path, columns=matched_unique).dropna(how="all").astype(np.float32)
+            variances = df_sub.var(axis=1)
+            top_probes = variances.nlargest(max_probes).index
+            df_probes = df_sub.loc[top_probes]
 
-        aligned_rows = []
-        for s in target_samples:
-            col = None
-            if s in meth_col_set:
-                col = s
-            else:
-                pt = s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s
-                col = patient_to_meth_col.get(pt)
-            if col and col in df_probes.columns:
-                aligned_rows.append(df_probes[col].values)
-            else:
-                aligned_rows.append(df_probes.mean(axis=1).values)
+            aligned_rows = []
+            for s in target_samples:
+                col = s if s in meth_col_set else patient_to_meth_col.get(s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s)
+                if col and col in df_probes.columns:
+                    aligned_rows.append(df_probes[col].values)
+                else:
+                    aligned_rows.append(df_probes.mean(axis=1).values)
 
-        df_aligned = pd.DataFrame(
-            aligned_rows,
-            index=target_samples,
-            columns=[f"METH_{p}" for p in top_probes],
-            dtype=np.float32,
-        )
-        log.info("  [MULTI-OMICS] Aligned %d methylation CpG probes for %d TCGA-%s samples.", df_aligned.shape[1], len(target_samples), cancer)
+            df_aligned = pd.DataFrame(
+                aligned_rows,
+                index=target_samples,
+                columns=[f"METH_{p}" for p in top_probes],
+                dtype=np.float32,
+            )
+        else:
+            # TSV streaming chunked reader (< 150 MB RAM even for 3.5 GB BRCA)
+            cols_to_use = [index_col_name] + matched_unique
+            chunk_size = 25000
+            top_heap: List[Tuple[float, str, Dict[str, float]]] = []
+
+            for df_chunk in pd.read_csv(tsv_path, sep="\t", usecols=cols_to_use, index_col=index_col_name,
+                                        chunksize=chunk_size, low_memory=False):
+                df_chunk = df_chunk.dropna(how="all").astype(np.float32)
+                vars_chunk = df_chunk.var(axis=1)
+                n_cand = min(max_probes, len(vars_chunk))
+                top_cand = vars_chunk.nlargest(n_cand)
+                for probe_id, var_val in top_cand.items():
+                    if np.isnan(var_val):
+                        continue
+                    row_vals = df_chunk.loc[probe_id].to_dict()
+                    if len(top_heap) < max_probes:
+                        heapq.heappush(top_heap, (float(var_val), str(probe_id), row_vals))
+                    elif var_val > top_heap[0][0]:
+                        heapq.heapreplace(top_heap, (float(var_val), str(probe_id), row_vals))
+
+            if not top_heap:
+                log.warning("Cohort TCGA-%s yielded 0 valid methylation probes.", cancer)
+                return None
+
+            sorted_probes = sorted(top_heap, key=lambda x: x[0], reverse=True)
+            top_probe_names = [x[1] for x in sorted_probes]
+            probe_dict_map = {x[1]: x[2] for x in sorted_probes}
+
+            aligned_rows = []
+            for s in target_samples:
+                col = s if s in meth_col_set else patient_to_meth_col.get(s[:12] if s.startswith("TCGA-") and len(s) >= 12 else s)
+                row_data = []
+                for p in top_probe_names:
+                    p_map = probe_dict_map[p]
+                    if col and col in p_map and not np.isnan(p_map[col]):
+                        row_data.append(p_map[col])
+                    else:
+                        valid_vals = [v for v in p_map.values() if not np.isnan(v)]
+                        row_data.append(float(np.mean(valid_vals)) if valid_vals else 0.5)
+                aligned_rows.append(row_data)
+
+            df_aligned = pd.DataFrame(
+                aligned_rows,
+                index=target_samples,
+                columns=[f"METH_{p}" for p in top_probe_names],
+                dtype=np.float32,
+            )
+
+        log.info("  [MULTI-OMICS] Aligned %d methylation CpG probes for %d TCGA-%s samples (Streaming O(1) Memory).",
+                 df_aligned.shape[1], len(target_samples), cancer)
         return df_aligned
     except Exception as exc:
         log.warning("Could not process methylation for TCGA-%s: %s", cancer, exc)

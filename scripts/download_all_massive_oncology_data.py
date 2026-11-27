@@ -353,9 +353,24 @@ def download_tcga_methylation_450k(raw_xena: Path, shards: Path, cohorts: Option
             if not dest_pq.exists():
                 try:
                     log.info("Converting %s -> %s (Snappy Parquet)...", tsv_name, dest_pq.name)
-                    df = pd.read_csv(dest_tsv, sep="\t", index_col=0, low_memory=False)
-                    df.to_parquet(dest_pq, compression="snappy")
-                    log.info("[METHYLATION SHARD READY] %s (%d probes x %d patients)", dest_pq.name, df.shape[0], df.shape[1])
+                    try:
+                        import pyarrow as pa
+                        import pyarrow.parquet as pq
+                        chunk_iter = pd.read_csv(dest_tsv, sep="\t", index_col=0, chunksize=25000, low_memory=False)
+                        first_chunk = next(chunk_iter).dropna(how="all").astype(np.float32)
+                        table = pa.Table.from_pandas(first_chunk)
+                        with pq.ParquetWriter(dest_pq, table.schema, compression="snappy") as writer:
+                            writer.write_table(table)
+                            total_rows = len(first_chunk)
+                            for chunk in chunk_iter:
+                                c = chunk.dropna(how="all").astype(np.float32)
+                                writer.write_table(pa.Table.from_pandas(c))
+                                total_rows += len(c)
+                        log.info("[METHYLATION SHARD READY] %s (~%d probes x %d patients)", dest_pq.name, total_rows, first_chunk.shape[1])
+                    except ImportError:
+                        df = pd.read_csv(dest_tsv, sep="\t", index_col=0, low_memory=False)
+                        df.to_parquet(dest_pq, compression="snappy")
+                        log.info("[METHYLATION SHARD READY] %s (%d probes x %d patients)", dest_pq.name, df.shape[0], df.shape[1])
                 except Exception as e:
                     log.warning("Methylation Parquet conversion note for %s: %s", cancer, e)
 
